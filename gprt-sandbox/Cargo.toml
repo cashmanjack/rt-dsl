@@ -1,0 +1,13 @@
+[package]
+name = "gprt-sandbox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gprt-core = { path = "../gprt-core" }
+gprt-macros = { path = "../gprt-macros" }
+gprt-optix = { path = "../gprt-optix" } # Removed optional = true
+
+[features]
+default = ["optix"] # Enable optix by default for the sandbox
+optix = ["gprt-macros/optix"] # Pass the feature down to gprt-macros

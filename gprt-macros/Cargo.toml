@@ -1,0 +1,17 @@
+[package]
+name = "gprt-macros"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+gprt-ir = { path = "../gprt-ir" }
+gprt-codegen = { path = "../gprt-codegen" }
+syn = { version = "2.0", features = ["full", "extra-traits", "visit"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[features]
+optix = [] # <--- ADD THIS BACK

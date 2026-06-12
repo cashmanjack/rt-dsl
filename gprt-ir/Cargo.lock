@@ -1,0 +1,8 @@
+[package]
+name = "gprt-ir"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Used to store the AST of the closures so backends can compile them to PTX/CPU code
+proc-macro2 = "1.0"

@@ -1,0 +1,33 @@
+# Rust build artifacts (matches target/ in ANY subdirectory)
+**/target/
+**/*.rs.bk
+
+# OptiX/CUDA build artifacts
+**/build/
+*.ptx
+*.optixir
+*.o
+*.d
+/tmp/gprt_build/
+
+# IDE and editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Dataset files (keep structure, exclude large binaries)
+*.csv
+*.txt
+!gprt-sandbox/benchmarks/data/.gitkeep
+!gprt-sandbox/benchmarks/queries/.gitkeep
+OneDrive_*/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS files
+.DS_Store
+Thumbs.db

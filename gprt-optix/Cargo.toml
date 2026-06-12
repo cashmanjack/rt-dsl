@@ -1,0 +1,10 @@
+[package]
+name = "gprt-optix"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gprt-core = { path = "../gprt-core" }
+
+[build-dependencies]
+cmake = "0.1"
