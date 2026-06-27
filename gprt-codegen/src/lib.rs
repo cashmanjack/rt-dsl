@@ -1,216 +1,203 @@
-use gprt_ir::RtProgram;
-use syn::{Expr, ExprMethodCall, ExprField, ExprPath, ExprAssign, ExprCall, Member, BinOp, ExprBinary, ExprLit, ExprParen, ExprBlock, Stmt};
+use gprt_ir::{RtProgram, ShaderNode};
+use syn::{Expr, ExprMethodCall, parse_quote, visit::Visit};
 use quote::quote;
-use std::collections::HashMap;
+use std::process::Command;
+use std::env;
+use std::fs;
 
-pub struct CodegenContext<'a> { pub array_indices: &'a HashMap<String, usize>, pub value_indices: &'a HashMap<String, usize> }
+// ==========================================
+// 1. THE POLYGLOT TRANSPILER (Rust -> CUDA)
+// ==========================================
+pub struct GpuCodegen {
+    pub cuda_string: String,
+    pub indent: usize,
+}
 
-pub fn translate_expr(ctx: &CodegenContext, expr: &Expr) -> String {
-    match expr {
-        Expr::Block(ExprBlock { block, .. }) => {
-            let mut stmts = Vec::new();
-            for stmt in &block.stmts {
-                match stmt {
-                    Stmt::Expr(e, _) => stmts.push(format!("{};", translate_expr(ctx, e))),
-                    _ => {}
-                }
-            }
-            format!("{{ {} }}", stmts.join(" "))
-        }
-        Expr::MethodCall(ExprMethodCall { receiver, method, args, .. }) => {
-            if method == "push" {
-                let vec_name = translate_expr(ctx, receiver);
-                if let Some(&idx) = ctx.array_indices.get(&vec_name) {
-                    let val = translate_expr(ctx, &args[0]);
-                    // 2D Demultiplexing: Each ray writes to its own slice using query_id
-
-return format!(
-    "{{ 
-        unsigned int __qid = optixGetLaunchIndex().x; 
-        unsigned int __idx = atomicAdd((unsigned int*)bundle->dyn_lens[{}] + __qid, 1u); 
-        if (__idx < bundle->dyn_caps[{}]) {{ 
-            ((unsigned int*)bundle->dyn_ptrs[{}])[__qid * bundle->dyn_caps[{}] + __idx] = {}; 
-        }} 
-    }}",
-    idx, idx, idx, idx, val
-);
-
-                }
-            }
-            format!("{}.{}({})", translate_expr(ctx, receiver), method, args.iter().map(|a| translate_expr(ctx, a)).collect::<Vec<_>>().join(", "))
-        }
-        Expr::Field(ExprField { base, member, .. }) => {
-            let base_str = translate_expr(ctx, base);
-            if let Member::Named(ident) = member {
-                if base_str == "hit" && ident == "primitive_id" { return "hit_primitive_id".to_string(); }
-                return format!("{}.{}", base_str, ident);
-            }
-            quote!(#expr).to_string().replace(" ", "")
-        }
-        Expr::Path(ExprPath { path, .. }) => {
-            let path_str = quote!(#path).to_string().replace(" ", "");
-            if path_str == "HitAction::Continue" || path_str == "gprt_core::HitAction::Continue" {
-                return "optixIgnoreIntersection()".to_string();
-            }
-            if path_str == "HitAction::Terminate" || path_str == "gprt_core::HitAction::Terminate" {
-                return "optixTerminateRay()".to_string();
-            }
-            if path_str == "HitAction::Ignore" || path_str == "gprt_core::HitAction::Ignore" {
-                return "optixIgnoreIntersection()".to_string();
-            }
-            path_str
-        }
-        Expr::Assign(ExprAssign { left, right, .. }) => {
-            let left_str = translate_expr(ctx, left);
-            if let Some(&idx) = ctx.value_indices.get(&left_str) {
-                let right_str = translate_expr(ctx, right);
-                return format!("*(unsigned int*)bundle->val_ptrs[{}] = {}", idx, right_str);
-            }
-            format!("{} = {}", left_str, translate_expr(ctx, right))
-        }
-        Expr::Call(ExprCall { func, args, .. }) => {
-            let func_str = quote!(#func).to_string().replace(" ", "");
-            if func_str == "Some" && !args.is_empty() { return translate_expr(ctx, &args[0]); }
-            format!("{}({})", translate_expr(ctx, func), args.iter().map(|a| translate_expr(ctx, a)).collect::<Vec<_>>().join(", "))
-        }
-        Expr::Binary(ExprBinary { left, op, right, .. }) => {
-            let op_str = match op {
-                BinOp::Add(_) => "+", BinOp::Sub(_) => "-", BinOp::Mul(_) => "*", BinOp::Div(_) => "/",
-                _ => "?",
-            };
-            format!("({} {} {})", translate_expr(ctx, left), op_str, translate_expr(ctx, right))
-        }
-        Expr::Lit(ExprLit { lit, .. }) => quote!(#lit).to_string(),
-        Expr::Paren(ExprParen { expr, .. }) => format!("({})", translate_expr(ctx, expr)),
-        _ => quote!(#expr).to_string().replace(" ", ""),
+impl GpuCodegen {
+    pub fn new() -> Self { Self { cuda_string: String::new(), indent: 1 } }
+    
+    fn emit(&mut self, s: &str) {
+        for _ in 0..self.indent { self.cuda_string.push_str("\t"); }
+        self.cuda_string.push_str(s);
+        self.cuda_string.push('\n');
+    }
+    
+    pub fn transpile_expr(&mut self, expr: &Expr) -> String {
+        let mut visitor = RustToCudaVisitor { out: String::new() };
+        visitor.visit_expr(expr);
+        visitor.out
     }
 }
 
+struct RustToCudaVisitor { out: String }
 
-
-
-pub fn generate_cuda_source(ir: &RtProgram) -> String {
-    let mut code = String::new();
-    code.push_str("#include <optix.h>\n#include <optix_device.h>\n#include <vector_types.h>\n#include <vector_functions.h>\n\n");
-    code.push_str("inline __device__ float gprt_dot(float3 a, float3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }\n\n");
-
-    code.push_str("struct PayloadBundle { unsigned long long dyn_ptrs[8]; unsigned int dyn_caps[8]; unsigned long long dyn_lens[8]; unsigned long long val_ptrs[8]; };\n");
-    code.push_str("struct LaunchParams { OptixTraversableHandle handle; float4* rays; int num_rays; PayloadBundle* bundle; };\n");
-    code.push_str("__constant__ LaunchParams params;\n\n");
-
-    let has_closest_hit = ir.closest_hit_tokens.is_some();
-    let has_any_hit_continue = ir.any_hit_tokens.as_ref().map_or(false, |ts| ts.to_string().contains("HitAction::Continue"));
-    let use_payload_tracking = has_closest_hit && has_any_hit_continue;
-    
-
-    code.push_str("extern \"C\" __global__ void __raygen__rg() {\n");
-    code.push_str("\tuint3 launch_idx = optixGetLaunchIndex();\n\tint idx = launch_idx.x;\n\tif (idx >= params.num_rays) return;\n");
-    code.push_str("\tfloat4 r = params.rays[idx];\n\tfloat3 origin = make_float3(r.x, r.y, r.z);\n\tfloat3 direction = make_float3(1.0f, 0.0f, 0.0f);\n\tfloat tmax = r.w;\n");
-    
-    if use_payload_tracking {
-        code.push_str("\tunsigned int p0 = __float_as_uint(tmax);\n");
-        code.push_str("\tunsigned int p1 = 0xFFFFFFFF;\n");
-        code.push_str("\toptixTrace(params.handle, origin, direction, 0.0f, tmax, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1);\n");
-        code.push_str("\tif (p1 != 0xFFFFFFFF) {\n");
-        code.push_str("\t\tunsigned int hit_primitive_id = p1;\n");
-        code.push_str("\t\tPayloadBundle* bundle = params.bundle; (void)bundle;\n");
-        let closest_hit_expr = ir.closest_hit_tokens.as_ref().map(|ts| syn::parse2::<Expr>(ts.clone()).unwrap());
-        let ctx = CodegenContext { array_indices: &ir.array_indices, value_indices: &ir.value_indices };
-        if let Some(expr) = &closest_hit_expr {
-            code.push_str(&format!("\t\t{}\n", translate_expr(&ctx, expr)));
+impl<'ast> Visit<'ast> for RustToCudaVisitor {
+    fn visit_expr_method_call(&mut self, i: &'ast ExprMethodCall) {
+        if i.method == "push" {
+            self.out.push_str("atomicAdd(&lens[qid], 1); /* push */");
+        } else if i.method == "distance" {
+            self.out.push_str("fast_distance(");
+            self.visit_expr(&i.receiver);
+            self.out.push_str(", ");
+            self.visit_expr(&i.args[0]);
+            self.out.push_str(")");
+        } else {
+            self.visit_expr(&i.receiver);
+            self.out.push_str(".");
+            self.out.push_str(&i.method.to_string());
+            self.out.push_str("(");
+            for (idx, arg) in i.args.iter().enumerate() {
+                if idx > 0 { self.out.push_str(", "); }
+                self.visit_expr(arg);
+            }
+            self.out.push_str(")");
         }
-        code.push_str("\t}\n");
-    } else {
-        code.push_str("\toptixTrace(params.handle, origin, direction, 0.0f, tmax, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u);\n");
     }
-    code.push_str("}\n\n");
     
-    code.push_str("extern \"C\" __global__ void __miss__ms() {}\n\n");
-
-    if ir.geom_type == "Sphere" {
-        code.push_str("struct SphereSbtData { float4* spheres; char padding[8]; };\n");
-        code.push_str("extern \"C\" __global__ void __intersection__is() {\n");
-        code.push_str("\tconst SphereSbtData* sbt = (const SphereSbtData*)optixGetSbtDataPointer();\n");
-        code.push_str("\tunsigned int prim_id = optixGetPrimitiveIndex();\n");
-        code.push_str("\tfloat4 sphere = sbt->spheres[prim_id];\n");
-
-        code.push_str("\tfloat3 o = optixGetObjectRayOrigin();\n"); // The query point
-        code.push_str("\tfloat3 center = make_float3(sphere.x, sphere.y, sphere.z);\n");
-        code.push_str("\tfloat dx = o.x - center.x;\n");
-        code.push_str("\tfloat dy = o.y - center.y;\n");
-        code.push_str("\tfloat dz = o.z - center.z;\n");
-        code.push_str("\tfloat dist_sq = dx*dx + dy*dy + dz*dz;\n");
-        code.push_str("\tfloat max_dist = optixGetRayTmax();\n"); // Read radius from Ray!
-        code.push_str("\tif (dist_sq <= max_dist * max_dist) {\n");
-        code.push_str("\t\toptixReportIntersection(max_dist, 0);\n"); // Dummy 't' value to trigger AnyHit
-        code.push_str("\t}\n}\n\n");
-    } else if ir.geom_type == "Triangle" {
-        code.push_str("struct TriangleSbtData { float3* vertices; unsigned int* indices; };\n\n");
-        // NO __intersection__is generated! Hardware handles it.
+    fn visit_expr_path(&mut self, i: &'ast syn::ExprPath) {
+        self.out.push_str(&quote!(#i).to_string().replace(" ", ""));
     }
-
-    let any_hit_expr = ir.any_hit_tokens.as_ref().map(|ts| syn::parse2::<Expr>(ts.clone()).unwrap());
-    let ctx = CodegenContext { array_indices: &ir.array_indices, value_indices: &ir.value_indices };
-
-    code.push_str("extern \"C\" __global__ void __anyhit__ah() {\n");
-    code.push_str("\tunsigned int hit_primitive_id = optixGetPrimitiveIndex();\n");
-    code.push_str("\tPayloadBundle* bundle = params.bundle; (void)sizeof(bundle);\n");
-    code.push_str("\t(void)sizeof(bundle); // Suppress NVCC #550\n\n");
-
-    if use_payload_tracking {
-        code.push_str("\tfloat current_min_t = __uint_as_float(optixGetPayload_0());\n");
-        code.push_str("\tfloat t = optixGetRayTmax();\n");
-        code.push_str("\tif (t < current_min_t) {\n");
-        code.push_str("\t\toptixSetPayload_0(__float_as_uint(t));\n");
-        code.push_str("\t\toptixSetPayload_1(hit_primitive_id);\n");
-        code.push_str("\t}\n");
+    
+    fn visit_expr_lit(&mut self, i: &'ast syn::ExprLit) {
+        self.out.push_str(&quote!(#i).to_string());
     }
-
-    if let Some(expr) = &any_hit_expr {
-        code.push_str(&format!("\t{}\n", translate_expr(&ctx, expr)));
-    }
-    code.push_str("}\n\n");
-
-    if use_payload_tracking {
-        code.push_str("extern \"C\" __global__ void __closesthit__ch() {} \n\n");
-    } else {
-        let closest_hit_expr = ir.closest_hit_tokens.as_ref().map(|ts| syn::parse2::<Expr>(ts.clone()).unwrap());
-        code.push_str("extern \"C\" __global__ void __closesthit__ch() {\n");
-        code.push_str("\tunsigned int hit_primitive_id = optixGetPrimitiveIndex();\n");
-
-        code.push_str("\tPayloadBundle* bundle = params.bundle; (void)sizeof(bundle);\n");
-
-        code.push_str("\t(void)sizeof(bundle); // Suppress NVCC #550\n\n");
-        if let Some(expr) = &closest_hit_expr {
-            code.push_str(&format!("\t{}\n", translate_expr(&ctx, expr)));
+    
+    fn visit_expr(&mut self, i: &'ast Expr) {
+        if self.out.is_empty() {
+            self.out.push_str(&quote!(#i).to_string().replace(" ", ""));
+        } else {
+            syn::visit::visit_expr(self, i);
         }
-        code.push_str("}\n\n");
     }
-
-    code
 }
 
+// ==========================================
+// 2. THE AST LOWERING (ShaderNode -> CUDA)
+// ==========================================
+impl GpuCodegen {
+    pub fn lower_node(&mut self, node: &ShaderNode) {
+        match node {
+            ShaderNode::TraceRay { tmax, on_hit, on_miss } => {
+                let tmax_str = quote!(#tmax).to_string();
+                self.emit(&format!("optixTrace(params.handle, origin, dir, 0.0f, {}, 0.0f, 255u, OPTIX_RAY_FLAG_DISABLE_ANYHIT, 0u, 1u, 0u, p0, p1);", tmax_str));
+                self.emit("if (p1 != 0xFFFFFFFF) {");
+                self.indent += 1;
+                self.lower_node(on_hit);
+                self.indent -= 1;
+                self.emit("} else {");
+                self.indent += 1;
+                self.lower_node(on_miss);
+                self.indent -= 1;
+                self.emit("}");
+            }
+            ShaderNode::PushToDynamicArray { array_name, value } => {
+                let val_str = self.transpile_expr(&parse_quote!(#value));
+                self.emit(&format!("unsigned int __idx = atomicAdd(&bundle->dyn_lens[{}], 1u);", array_name));
+                self.emit(&format!("if (__idx < bundle->dyn_caps[{}]) bundle->dyn_ptrs[{}][__idx] = {};", array_name, array_name, val_str));
+            }
+            ShaderNode::If { condition, then_body, else_body } => {
+                let cond_str = self.transpile_expr(&parse_quote!(#condition));
+                self.emit(&format!("if ({}) {{", cond_str));
+                self.indent += 1;
+                self.lower_node(then_body);
+                self.indent -= 1;
+                self.emit("} else {");
+                self.indent += 1;
+                self.lower_node(else_body);
+                self.indent -= 1;
+                self.emit("}");
+            }
+            ShaderNode::Block(stmts) => {
+                for stmt in stmts { self.lower_node(stmt); }
+            }
+            ShaderNode::RawCuda(code) => {
+                self.emit(code);
+            }
+            _ => {}
+        }
+    }
+}
 
+pub fn compile_program(ir: &RtProgram) -> Vec<u8> {
+    let mut codegen = GpuCodegen::new();
+    
+    codegen.emit("#include <optix.h>");
+    codegen.emit("#include <optix_device.h>");
+    codegen.emit("#include <vector_types.h>");
+    codegen.emit("");
+    codegen.emit("struct PayloadBundle { unsigned long long dyn_ptrs[8]; unsigned int dyn_caps[8]; unsigned long long dyn_lens[8]; unsigned long long val_ptrs[8]; };");
 
+    codegen.emit("struct LaunchParams { OptixTraversableHandle handle; float4* rays; int num_rays; PayloadBundle* bundle; float4* geom; };");
+    codegen.emit("__constant__ LaunchParams params;");
+    
+    codegen.emit("");
+    codegen.emit("extern \"C\" __global__ void __raygen__rg() {");
+    codegen.indent += 1;
+    codegen.lower_node(&ir.raygen_body);
+    codegen.indent -= 1;
+    codegen.emit("}");
+    
+    if let Some(miss) = &ir.miss_body {
+        codegen.emit("extern \"C\" __global__ void __miss__ms() {");
+        codegen.indent += 1;
+        codegen.lower_node(miss);
+        codegen.indent -= 1;
+        codegen.emit("}");
+    } else {
+        codegen.emit("extern \"C\" __global__ void __miss__ms() {}");
+    }
 
+    if let Some(anyhit) = &ir.anyhit_body {
+        codegen.emit("extern \"C\" __global__ void __anyhit__ah() {");
+        codegen.indent += 1;
+        codegen.lower_node(anyhit);
+        codegen.indent -= 1;
+        codegen.emit("}");
+    } else {
+        codegen.emit("extern \"C\" __global__ void __anyhit__ah() {}");
+    }
 
-pub fn compile_to_ptx(cuda_source: &str) -> String {
-    use std::env; use std::fs; use std::process::Command;
-    let optix_path = env::var("OPTIX_PATH").expect("OPTIX_PATH env variable must be set!");
-    let include_arg = format!("-I{}/include", optix_path);
-    let temp_dir = env::temp_dir().join("gprt_build"); fs::create_dir_all(&temp_dir).unwrap();
-    let cu_file = temp_dir.join("shader.cu"); let ptx_file = temp_dir.join("shader.ptx");
-    fs::write(&cu_file, cuda_source).unwrap();
-    let arch_arg = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
-    let status = Command::new("nvcc").arg("-ptx").arg("-O3").arg("--use_fast_math").arg("-std=c++11").arg(format!("-arch={}", arch_arg)).arg(&include_arg).arg("-o").arg(&ptx_file).arg(&cu_file).status().expect("Failed to run nvcc.");
-    if !status.success() { panic!("NVCC compilation failed!"); }
-    let ptx_content = fs::read_to_string(&ptx_file).unwrap();
-    let _ = fs::remove_file(cu_file); let _ = fs::remove_file(ptx_file);
-    ptx_content
+    if let Some(closesthit) = &ir.closesthit_body {
+        codegen.emit("extern \"C\" __global__ void __closesthit__ch() {");
+        codegen.indent += 1;
+        codegen.lower_node(closesthit);
+        codegen.indent -= 1;
+        codegen.emit("}");
+    } else {
+        codegen.emit("extern \"C\" __global__ void __closesthit__ch() { optixSetPayload_0(1); }");
+    }
+
+    if let Some(intersection) = &ir.intersection_body {
+        codegen.emit("extern \"C\" __global__ void __intersection__is() {");
+        codegen.indent += 1;
+        codegen.lower_node(intersection);
+        codegen.indent -= 1;
+        codegen.emit("}");
+    } else {
+        // GPU-SIDE EXACTNESS: TrueKNN / Arkade Filter
+        codegen.emit("extern \"C\" __global__ void __intersection__is() {");
+        codegen.indent += 1;
+        codegen.emit("unsigned int prim_id = optixGetPrimitiveIndex();");
+        codegen.emit("float4 sphere = params.geom[prim_id];");
+        codegen.emit("float3 o = optixGetWorldRayOrigin();");
+        codegen.emit("float dx = o.x - sphere.x; float dy = o.y - sphere.y; float dz = o.z - sphere.z;");
+        codegen.emit("float dist_sq = dx*dx + dy*dy + dz*dz;");
+
+        codegen.emit("float search_radius_sq = __uint_as_float(optixGetPayload_2());"); // P2 holds r^2
+        
+        codegen.emit("if (dist_sq <= search_radius_sq) {");
+        // Record exact distance in Payload 3 for AnyHit Heap sorting
+        codegen.emit("    optixSetPayload_3(__float_as_uint(dist_sq));");
+        codegen.emit("    optixReportIntersection(0.0f, 0u);");
+        codegen.emit("}");
+        codegen.indent -= 1;
+        codegen.emit("}");
+    }
+    
+    compile_to_optixir(&codegen.cuda_string)
 }
 
 pub fn compile_to_optixir(cuda_source: &str) -> Vec<u8> {
-    use std::env; use std::fs; use std::process::Command;
     let optix_path = env::var("OPTIX_PATH").expect("OPTIX_PATH env variable must be set!");
     let include_arg = format!("-I{}/include", optix_path);
     let temp_dir = env::temp_dir().join("gprt_build"); fs::create_dir_all(&temp_dir).unwrap();
@@ -218,7 +205,6 @@ pub fn compile_to_optixir(cuda_source: &str) -> Vec<u8> {
     fs::write(&cu_file, cuda_source).unwrap();
     let arch_arg = env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_89".to_string());
     
-    // Compile to OptiX-IR (LLVM Bitcode)
     let status = Command::new("nvcc")
         .arg("-optix-ir").arg("-O3").arg("--use_fast_math").arg("-std=c++11")
         .arg(format!("-arch={}", arch_arg)).arg(&include_arg)
