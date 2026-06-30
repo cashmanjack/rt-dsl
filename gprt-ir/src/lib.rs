@@ -39,7 +39,19 @@ pub enum RadiusHeuristic {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MemoryStrategy {
     GlobalMemory,        
-    PayloadRegisterHeap, // High Performance Strategy
+    PayloadRegisterHeap, 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BvhBuildStrategy {
+    PreferFastTrace, // SAH Optimization (Slow Build, Fast Trace)
+    PreferFastBuild, // Linear Split (Fast Build, Slow Trace)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum GeometryType {
+    Spheres,
+    Triangles,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +61,8 @@ pub struct Schedule {
     pub use_morton_lbv: bool,
     pub radius_heuristic: RadiusHeuristic,
     pub memory_strategy: MemoryStrategy,
+    pub build_strategy: BvhBuildStrategy, // EXPOSED BUILD STRATEGY
+    pub geom_type: GeometryType,          // EXPOSED GEOMETRY TYPE
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,7 +81,9 @@ impl Default for Schedule {
             radius_increment_mult: 3.0,
             max_hits_per_query: 2000,
             use_morton_lbv: false,
-            memory_strategy: MemoryStrategy::PayloadRegisterHeap, // Default to Register Heap!
+            memory_strategy: MemoryStrategy::PayloadRegisterHeap,
+            build_strategy: BvhBuildStrategy::PreferFastTrace, // Default to high quality SAH
+            geom_type: GeometryType::Spheres,                  // Default to Spheres
         }
     }
 }

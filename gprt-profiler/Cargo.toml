@@ -1,0 +1,13 @@
+[package]
+name = "gprt-profiler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gprt-core = { path = "../gprt-core" }
+gprt-optix = { path = "../gprt-optix" }
+gprt-ir = { path = "../gprt-ir" }
+serde_json = "1.0"
+rayon = "1.8"
+memmap2 = "0.9"
+rand = "0.8"

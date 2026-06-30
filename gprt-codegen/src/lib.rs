@@ -167,6 +167,7 @@ pub fn compile_program(ir: &RtProgram) -> Vec<u8> {
         codegen.emit("extern \"C\" __global__ void __closesthit__ch() { optixSetPayload_0(1); }");
     }
 
+    // FULLY ABSTRACTED: Generates dynamic intersection shaders strictly if defined by macro AST
     if let Some(intersection) = &ir.intersection_body {
         codegen.emit("extern \"C\" __global__ void __intersection__is() {");
         codegen.indent += 1;
@@ -174,31 +175,15 @@ pub fn compile_program(ir: &RtProgram) -> Vec<u8> {
         codegen.indent -= 1;
         codegen.emit("}");
     } else {
-        // GPU-SIDE EXACTNESS: TrueKNN / Arkade Filter
-        codegen.emit("extern \"C\" __global__ void __intersection__is() {");
-        codegen.indent += 1;
-        codegen.emit("unsigned int prim_id = optixGetPrimitiveIndex();");
-        codegen.emit("float4 sphere = params.geom[prim_id];");
-        codegen.emit("float3 o = optixGetWorldRayOrigin();");
-        codegen.emit("float dx = o.x - sphere.x; float dy = o.y - sphere.y; float dz = o.z - sphere.z;");
-        codegen.emit("float dist_sq = dx*dx + dy*dy + dz*dz;");
-
-        codegen.emit("float search_radius_sq = __uint_as_float(optixGetPayload_2());"); // P2 holds r^2
-        
-        codegen.emit("if (dist_sq <= search_radius_sq) {");
-        // Record exact distance in Payload 3 for AnyHit Heap sorting
-        codegen.emit("    optixSetPayload_3(__float_as_uint(dist_sq));");
-        codegen.emit("    optixReportIntersection(0.0f, 0u);");
-        codegen.emit("}");
-        codegen.indent -= 1;
-        codegen.emit("}");
+        codegen.emit("extern \"C\" __global__ void __intersection__is() {}");
     }
     
-    compile_to_optixir(&codegen.cuda_string)
+    compile_program_to_optixir(&codegen.cuda_string)
 }
 
-pub fn compile_to_optixir(cuda_source: &str) -> Vec<u8> {
-    let optix_path = env::var("OPTIX_PATH").expect("OPTIX_PATH env variable must be set!");
+pub fn compile_program_to_optixir(cuda_source: &str) -> Vec<u8> {
+    let optix_path = env::var("OPTIX_PATH")
+        .unwrap_or_else(|_| option_env!("OPTIX_PATH").unwrap_or("/home/min/a/cashman3/optix_sdk").to_string());
     let include_arg = format!("-I{}/include", optix_path);
     let temp_dir = env::temp_dir().join("gprt_build"); fs::create_dir_all(&temp_dir).unwrap();
     let cu_file = temp_dir.join("shader.cu"); let ir_file = temp_dir.join("shader.optixir");

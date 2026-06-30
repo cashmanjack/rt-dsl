@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Expr, ExprClosure, Token, parse::{Parse, ParseStream}, LitStr};
+use syn::{parse_macro_input, Expr, ExprClosure, Token, parse::{Parse, ParseStream}};
 use std::collections::HashSet;
 use syn::visit::Visit;
 
@@ -48,17 +48,19 @@ impl Parse for RnnInput {
     }
 }
 
-struct RnnRunInput { index: Expr, rays: Expr, schedule: Expr, cap: Expr, name: LitStr }
+
+struct RnnRunInput { index: Expr, rays: Expr, schedule: Expr, cap: Expr, name: syn::Ident } 
 impl Parse for RnnRunInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let index: Expr = input.parse()?; input.parse::<Token![,]>()?;
         let rays: Expr = input.parse()?; input.parse::<Token![,]>()?;
         let schedule: Expr = input.parse()?; input.parse::<Token![,]>()?;
         let cap: Expr = input.parse()?; input.parse::<Token![,]>()?;
-        let name: LitStr = input.parse()?;
+        let name: syn::Ident = input.parse()?; 
         Ok(RnnRunInput { index, rays, schedule, cap, name })
     }
 }
+
 
 struct KnnInput { data: Expr, queries: Expr, k: Expr, output: Expr, schedule: Option<Expr> }
 impl Parse for KnnInput {
@@ -132,135 +134,152 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
     let rays = input.rays;
     let schedule = input.schedule;
     let cap = input.cap;
-    let name = input.name.value();
-
-    // =========================================================================
-    // IMPLEMENTATION PATH A: GLOBAL MEMORY (Standard TrueKNN)
-    // =========================================================================
-    let raygen_cuda_global = r#"
-        uint3 launch_idx = optixGetLaunchIndex(); int idx = launch_idx.x; if (idx >= params.num_rays) return;
-        PayloadBundle* bundle = params.bundle;
-        ((unsigned int*)bundle->dyn_lens[0])[idx] = 0;
-        float r_val = params.rays[idx].w;
-        float3 origin = make_float3(params.rays[idx].x, params.rays[idx].y, params.rays[idx].z); 
-        float3 direction = make_float3(1.0f, 0.0f, 0.0f);
-        unsigned int p0 = 0, p1 = 0xFFFFFFFF, p2 = __float_as_uint(r_val * r_val), p3 = 0; 
-        optixTrace(params.handle, origin, direction, 0.0f, 1e-5f, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1, p2, p3);
-    "#;
-    
-    let anyhit_cuda_global = r#"
-        unsigned int prim_id = optixGetPrimitiveIndex();
-        PayloadBundle* bundle = params.bundle; unsigned int __qid = optixGetLaunchIndex().x;
-        unsigned int __idx = atomicAdd((unsigned int*)bundle->dyn_lens[0] + __qid, 1u);
-        if (__idx < bundle->dyn_caps[0]) {
-            ((unsigned int*)bundle->dyn_ptrs[0])[__qid * bundle->dyn_caps[0] + __idx] = prim_id;
-        }
-        optixIgnoreIntersection();
-    "#;
-
-    // =========================================================================
-    // IMPLEMENTATION PATH B: REGISTER HEAP (Arkade Style - Ultra Aggressive)
-    // =========================================================================
-    let raygen_cuda_register_heap = r#"
-        struct LocalHeap {
-            unsigned int ids[5];
-            float dists[5];
-            float worst_dist;
-        };
-
-        uint3 launch_idx = optixGetLaunchIndex(); int idx = launch_idx.x; if (idx >= params.num_rays) return;
-        float r_val = params.rays[idx].w;
-        float3 origin = make_float3(params.rays[idx].x, params.rays[idx].y, params.rays[idx].z); 
-        float3 direction = make_float3(1.0f, 0.0f, 0.0f);
-
-        LocalHeap heap;
-        for (int i = 0; i < 5; i++) {
-            heap.ids[i] = 0xFFFFFFFF;
-            heap.dists[i] = r_val * r_val;
-        }
-        heap.worst_dist = r_val * r_val;
-
-        // Pack local heap address into payloads 0 and 1
-        unsigned long long heap_ptr = (unsigned long long)&heap;
-        unsigned int p0 = heap_ptr & 0xFFFFFFFF;
-        unsigned int p1 = (heap_ptr >> 32) & 0xFFFFFFFF;
-        unsigned int p2 = __float_as_uint(r_val * r_val);
-        unsigned int p3 = 0; // Filled by Intersection
-
-        optixTrace(params.handle, origin, direction, 0.0f, 1e-5f, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1, p2, p3);
-
-        // Write final sorted heap directly back to host-ready flat VRAM buffer
-        PayloadBundle* bundle = params.bundle;
-        unsigned int* out_ptr = (unsigned int*)bundle->dyn_ptrs[0];
-        unsigned int count = 0;
-        for (int i = 0; i < 5; i++) {
-            out_ptr[idx * 5 + i] = heap.ids[i];
-            if (heap.ids[i] != 0xFFFFFFFF) count++;
-        }
-        ((unsigned int*)bundle->dyn_lens[0])[idx] = count;
-    "#;
-
-    let anyhit_cuda_register_heap = r#"
-        struct LocalHeap {
-            unsigned int ids[5];
-            float dists[5];
-            float worst_dist;
-        };
-
-        unsigned int prim_id = optixGetPrimitiveIndex();
-        float dist_sq = __uint_as_float(optixGetPayload_3()); // Written by Intersection
-
-        unsigned long long heap_ptr = optixGetPayload_0() | ((unsigned long long)optixGetPayload_1() << 32);
-        LocalHeap* heap = (LocalHeap*)heap_ptr;
-
-        if (dist_sq < heap->worst_dist) {
-            heap->dists[4] = dist_sq;
-            heap->ids[4] = prim_id;
-
-            // Register bubble-sort (GPU register-level sorting, takes ~5 cycles)
-            for (int i = 3; i >= 0; i--) {
-                if (heap->dists[i+1] < heap->dists[i]) {
-                    float tmp_d = heap->dists[i]; heap->dists[i] = heap->dists[i+1]; heap->dists[i+1] = tmp_d;
-                    unsigned int tmp_id = heap->ids[i]; heap->ids[i] = heap->ids[i+1]; heap->ids[i+1] = tmp_id;
-                }
-            }
-            heap->worst_dist = heap->dists[4];
-            
-            // Dynamic Ray Traversal Pruning: shrink tracing threshold on-the-fly!
-            optixSetPayload_2(__float_as_uint(heap->worst_dist)); 
-        }
-        optixIgnoreIntersection();
-    "#;
+    let name = input.name.to_string();
 
     let expanded = quote! {
         {
-            static __GPRT_RNN_PIPELINE: std::sync::OnceLock<gprt_optix::OptixPipeline> = std::sync::OnceLock::new();
-            let __pipeline = __GPRT_RNN_PIPELINE.get_or_init(|| {
-                let __is_register_heap = #schedule.memory_strategy == gprt_ir::MemoryStrategy::PayloadRegisterHeap;
-                let __rg = if __is_register_heap { #raygen_cuda_register_heap } else { #raygen_cuda_global };
-                let __ah = if __is_register_heap { #anyhit_cuda_register_heap } else { #anyhit_cuda_global };
+            // Cache pipelines per cap value to avoid recompiling on every iteration
+            static __GPRT_RNN_PIPELINE_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, gprt_optix::OptixPipeline>>> = std::sync::OnceLock::new();
+            let __cache = __GPRT_RNN_PIPELINE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+            
+            let __cap_val: u32 = #cap;
+            let __schedule_clone = #schedule.clone();
+            
+            let mut __map = __cache.lock().unwrap();
+            
+            if !__map.contains_key(&__cap_val) {
+                let __is_register_heap = __schedule_clone.memory_strategy == gprt_ir::MemoryStrategy::PayloadRegisterHeap;
+                let __k_str = __cap_val.to_string(); 
+                
+                let __struct_def = format!(r#"
+                    struct LocalHeap {{
+                        unsigned int ids[{}];
+                        float dists[{}];
+                        float worst_dist;
+                    }};
+                "#, __k_str, __k_str);
+
+                let __raygen_cuda_global = r#"
+                    uint3 launch_idx = optixGetLaunchIndex(); int idx = launch_idx.x; if (idx >= params.num_rays) return;
+                    PayloadBundle* bundle = params.bundle;
+                    ((unsigned int*)bundle->dyn_lens[0])[idx] = 0;
+                    float r_val = params.rays[idx].w;
+                    float3 origin = make_float3(params.rays[idx].x, params.rays[idx].y, params.rays[idx].z); 
+                    float3 direction = make_float3(1.0f, 0.0f, 0.0f);
+                    unsigned int p0 = 0, p1 = 0xFFFFFFFF, p2 = __float_as_uint(r_val * r_val), p3 = 0; 
+                    optixTrace(params.handle, origin, direction, 0.0f, 1e-5f, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1, p2, p3);
+                "#.to_string();
+                
+                let __anyhit_cuda_global = r#"
+                    unsigned int prim_id = optixGetPrimitiveIndex();
+                    PayloadBundle* bundle = params.bundle; unsigned int __qid = optixGetLaunchIndex().x;
+                    unsigned int __idx = atomicAdd((unsigned int*)bundle->dyn_lens[0] + __qid, 1u);
+                    if (__idx < bundle->dyn_caps[0]) {
+                        ((unsigned int*)bundle->dyn_ptrs[0])[__qid * bundle->dyn_caps[0] + __idx] = prim_id;
+                    }
+                    optixIgnoreIntersection();
+                "#.to_string();
+
+                let __raygen_cuda_register_heap = format!(r#"
+                    {}
+
+                    uint3 launch_idx = optixGetLaunchIndex(); int idx = launch_idx.x; if (idx >= params.num_rays) return;
+                    float r_val = params.rays[idx].w;
+                    float3 origin = make_float3(params.rays[idx].x, params.rays[idx].y, params.rays[idx].z); 
+                    float3 direction = make_float3(1.0f, 0.0f, 0.0f);
+
+                    LocalHeap heap;
+                    for (int i = 0; i < {}; i++) {{
+                        heap.ids[i] = 0xFFFFFFFF;
+                        heap.dists[i] = r_val * r_val;
+                    }}
+                    heap.worst_dist = r_val * r_val;
+
+                    unsigned long long heap_ptr = (unsigned long long)&heap;
+                    unsigned int p0 = heap_ptr & 0xFFFFFFFF;
+                    unsigned int p1 = (heap_ptr >> 32) & 0xFFFFFFFF;
+                    unsigned int p2 = __float_as_uint(r_val * r_val);
+                    unsigned int p3 = 0; 
+
+                    optixTrace(params.handle, origin, direction, 0.0f, 1e-5f, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1, p2, p3);
+
+                    PayloadBundle* bundle = params.bundle;
+                    unsigned int* out_ptr = (unsigned int*)bundle->dyn_ptrs[0];
+                    unsigned int count = 0;
+                    for (int i = 0; i < {}; i++) {{
+                        out_ptr[idx * {} + i] = heap.ids[i];
+                        if (heap.ids[i] != 0xFFFFFFFF) count++;
+                    }}
+                    ((unsigned int*)bundle->dyn_lens[0])[idx] = count;
+                "#, __struct_def, __k_str, __k_str, __k_str);
+
+                let __anyhit_cuda_register_heap = format!(r#"
+                    {}
+
+                    unsigned int prim_id = optixGetPrimitiveIndex();
+                    float dist_sq = __uint_as_float(optixGetPayload_3()); 
+
+                    unsigned long long heap_ptr = optixGetPayload_0() | ((unsigned long long)optixGetPayload_1() << 32);
+                    LocalHeap* heap = (LocalHeap*)heap_ptr;
+
+                    if (dist_sq < heap->worst_dist) {{
+                        heap->dists[{} - 1] = dist_sq;
+                        heap->ids[{} - 1] = prim_id;
+
+                        for (int i = {} - 2; i >= 0; i--) {{
+                            if (heap->dists[i+1] < heap->dists[i]) {{
+                                float tmp_d = heap->dists[i]; heap->dists[i] = heap->dists[i+1]; heap->dists[i+1] = tmp_d;
+                                unsigned int tmp_id = heap->ids[i]; heap->ids[i] = heap->ids[i+1]; heap->ids[i+1] = tmp_id;
+                            }}
+                        }}
+                        heap->worst_dist = heap->dists[{} - 1];
+                        optixSetPayload_2(__float_as_uint(heap->worst_dist)); 
+                    }}
+                    optixIgnoreIntersection();
+                "#, __struct_def, __k_str, __k_str, __k_str, __k_str);
+
+                let __intersection_cuda = r#"
+                    unsigned int prim_id = optixGetPrimitiveIndex();
+                    float4 sphere = params.geom[prim_id];
+                    float3 o = optixGetWorldRayOrigin();
+                    float dx = o.x - sphere.x; float dy = o.y - sphere.y; float dz = o.z - sphere.z;
+                    float dist_sq = dx*dx + dy*dy + dz*dz;
+                    float search_radius_sq = __uint_as_float(optixGetPayload_2());
+                    if (dist_sq <= search_radius_sq) {
+                        optixSetPayload_3(__float_as_uint(dist_sq));
+                        optixReportIntersection(0.0f, 0u);
+                    }
+                "#.to_string();
+
+                let __rg = if __is_register_heap { __raygen_cuda_register_heap } else { __raygen_cuda_global };
+                let __ah = if __is_register_heap { __anyhit_cuda_register_heap } else { __anyhit_cuda_global };
 
                 let __ir = gprt_ir::RtProgram {
-                    raygen_body: gprt_ir::ShaderNode::RawCuda(__rg.to_string()),
-                    anyhit_body: Some(gprt_ir::ShaderNode::RawCuda(__ah.to_string())),
-                    miss_body: None, closesthit_body: None, intersection_body: None,
-                    payload_layout: vec![], schedule: #schedule.clone(), array_indices: std::collections::HashMap::new(),
+                    raygen_body: gprt_ir::ShaderNode::RawCuda(__rg),
+                    anyhit_body: Some(gprt_ir::ShaderNode::RawCuda(__ah)),
+                    miss_body: None, closesthit_body: None, 
+                    intersection_body: Some(gprt_ir::ShaderNode::RawCuda(__intersection_cuda)),
+                    payload_layout: vec![], schedule: __schedule_clone, array_indices: std::collections::HashMap::new(),
                 };
-                gprt_optix::OptixPipeline::new(&gprt_codegen::compile_program(&__ir), false)
-            });
+                
+                let __pipeline = gprt_optix::OptixPipeline::new(&gprt_codegen::compile_program(&__ir), false);
+                __map.insert(__cap_val, __pipeline);
+            }
             
-            let __num_rays: usize = #rays.len();
-            __pipeline.register_array_batched(#name, #cap, __num_rays);
-            __pipeline.trace_scene(&mut #index.scene, &#rays);
-            __pipeline.retrieve_array_batched(#name, __num_rays, #cap as usize)
+            let __pipeline = __map.get(&__cap_val).unwrap();
+            let __num_rays = #rays.len();
+            
+            // FIXED: Explicitly format the name as a string literal to prevent "expected identifier" phantom errors
+            let __name_str: &str = #name;
+            __pipeline.register_array_batched(__name_str, __cap_val, __num_rays);
+            __pipeline.trace_scene(&mut #index.scene, &#rays, &#schedule); 
+            __pipeline.retrieve_array_batched(__name_str, __num_rays, __cap_val as usize)
         }
     };
     TokenStream::from(expanded)
+
 }
 
-// ==========================================
-// 3. EXPOSED ALGORITHMIC LOOP (kNN)
-// ==========================================
 #[proc_macro]
 pub fn k_nn(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as KnnInput);
@@ -306,14 +325,9 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
             }
             println!("[GPRT_LOOP] Initial Radius Calculated: {:.5}", __current_radius);
             
-            let mut __index = gprt_macros::gprt_build_index!(
-                #data, 
-                |__p: &gprt_core::Vec3| gprt_core::Sphere { center: *__p, radius: __current_radius }, 
-                __schedule.clone()
-            ); 
-            
-            // WARP COHERENCE OPTIMIZATION:
-            // If use_morton_lbv is true, sort queries to match Z-order cache lines
+            let __scene = gprt_core::Scene::build(#data.iter().map(|__p| gprt_core::Sphere { center: *__p, radius: __current_radius }));
+            let mut __index = gprt_optix::IndexBuilder { scene: __scene, schedule: __schedule.clone() };            
+
             let mut __active_indices: Vec<usize> = if __schedule.use_morton_lbv {
                 gprt_core::morton::sort_by_morton(&#queries)
             } else {
@@ -347,7 +361,8 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
                     .collect();
                 
                 let __t_trace = std::time::Instant::now();
-                let (__flat_res, __lens) = gprt_macros::gprt_rnn_run!(__index, __rays, __schedule, __dynamic_cap, "out");
+                let __cap_u32: u32 = __dynamic_cap;
+                let (__flat_res, __lens) = gprt_macros::gprt_rnn_run!(__index, __rays, __schedule, __cap_u32, out);
                 __total_search_time += __t_trace.elapsed();
                 
                 let mut __next_active = Vec::new();
@@ -356,7 +371,7 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
                 if __schedule.memory_strategy == gprt_ir::MemoryStrategy::PayloadRegisterHeap {
                     for (local_idx, &global_qi) in __active_indices.iter().enumerate() {
                         let hit_count = __lens[local_idx] as usize;
-                        let start = local_idx * 5; 
+                        let start = local_idx * (#k as usize); 
 
                         if hit_count >= #k {
                             for __i in 0..#k { #output[global_qi].push(__flat_res[start + __i]); }
@@ -434,10 +449,6 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-
-
-
-
 // ==========================================
 // 4. LEGACY TRACE / RNN / BARNES HUT 
 // ==========================================
@@ -479,7 +490,7 @@ pub fn gprt_trace(input: TokenStream) -> TokenStream {
             });
             let __num_rays: usize = #rays.len();
             __pipeline.register_array_batched("flat_out", 1000000u32, 1); 
-            __pipeline.trace_scene(&mut #index.scene, &#rays);
+            __pipeline.trace_scene(&mut #index.scene, &#rays, &#index.schedule);
 
             let __batched = __pipeline.retrieve_array_batched("flat_out", 1, 1000000);
             #array_ident.clear();
@@ -536,7 +547,7 @@ pub fn gprt_trace_batched(input: TokenStream) -> TokenStream {
             let __num_rays: usize = #rays.len();
             let __cap: u32 = #cap;
             __pipeline.register_array_batched("batched_out", __cap, __num_rays);
-            __pipeline.trace_scene(&mut #index.scene, &#rays);
+            __pipeline.trace_scene(&mut #index.scene, &#rays, &#index.schedule);
             
             let __batched_data: (Vec<u32>, Vec<u32>) = __pipeline.retrieve_array_batched("batched_out", __num_rays, __cap as usize);
             (__batched_data.0, __batched_data.1, __cap)
@@ -600,7 +611,7 @@ pub fn barnes_hut(input: TokenStream) -> TokenStream {
             for (unsigned int i = 0; i < routing.num_particles; i = i + 1) {
                 Body b = params.bodies[routing.bucket_start + i];
                 float3 d_diff = make_float3(b.pos.x - params.bodies[qid].pos.x, b.pos.y - params.bodies[qid].pos.y, b.pos.z - params.bodies[qid].pos.z);
-                float d_dist_sq = gprt_dot(d_diff, d_diff);
+                float d_dist_sq = gprt_dot(d_diff, d_dist_sq);
                 if (d_dist_sq > 1e-10f) { float denom = d_dist_sq * sqrt(d_dist_sq + 1e-6f); float force_mag = (6.674e-11f * params.bodies[qid].mass * b.mass) / denom; state.x += d_diff.x * force_mag; state.y += d_diff.y * force_mag; state.z += d_diff.z * force_mag; }
             } optixSetPayload_0(routing.autorope);
         } else {
