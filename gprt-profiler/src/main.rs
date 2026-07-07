@@ -37,7 +37,7 @@ fn main() {
     // 1. SMARTER SEARCH SPACE
     // Removed 0.50 and 0.90. TrueKNN almost never benefits from massive starting radii 
     // because it causes catastrophic AABB overlap on Iteration 1.
-    let percentiles = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20];
+    let percentiles = [0.001, 0.005, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 0.99];
     let multipliers = [2.0, 3.0, 4.0];
     let caps = [500, 2000, 5000, 10_000];
     

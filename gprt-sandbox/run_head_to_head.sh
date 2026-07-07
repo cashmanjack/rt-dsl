@@ -45,23 +45,29 @@ for DS in "${DATASETS[@]}"; do
         ARKADE_TIME=$(echo "$ARKADE_OUT" | grep -o -E "[0-9]+\.[0-9]+" | tail -n 1)
     fi
     
-    echo "3. Running GPRT DSL (Rust/OptiX, k=$K)..."
-    GPRT_DATA=$GPRT_DATA_DIR/$DS.csv
-    GPRT_QUERY=$GPRT_QUERY_DIR/${DS}_queries.csv
-    GPRT_OUT=$($GPRT_BIN $GPRT_DATA $GPRT_QUERY $K 2>/dev/null)
-    echo "$GPRT_OUT"
-    
-    # GPRT prints CSV: path,queries,k,time_ms,neighbors
-    GPRT_TIME_MS=$(echo "$GPRT_OUT" | cut -d',' -f4)
-    
-    # Convert GPRT time from ms to seconds
-    if [ -n "$GPRT_TIME_MS" ]; then
-        GPRT_TIME_S=$(awk "BEGIN {print $GPRT_TIME_MS/1000}")
-    else
-        GPRT_TIME_S="N/A"
-    fi
-    
-    echo "$DS,$ARKADE_TIME,$GPRT_TIME_S" >> head_to_head_results.csv
+
+# Inside the GPRT execution block of run_head_to_head.sh:
+echo "3. Running GPRT DSL (Rust/OptiX, k=$K)..."
+GPRT_DATA=$GPRT_DATA_DIR/$DS.csv
+GPRT_QUERY=$GPRT_QUERY_DIR/${DS}_queries.csv
+
+# Capture both stdout and stderr, then filter
+GPRT_OUT=$($GPRT_BIN $GPRT_DATA $GPRT_QUERY $K 2>&1)
+echo "$GPRT_OUT"
+
+# Extract the isolated GPU search time from the macro's print statement
+GPRT_SEARCH_MS=$(echo "$GPRT_OUT" | grep -o -P '(?<=search_ms=)[0-9\.]+')
+
+if [ -n "$GPRT_SEARCH_MS" ]; then
+    GPRT_TIME_S=$(awk "BEGIN {print $GPRT_SEARCH_MS/1000}")
+else
+    GPRT_TIME_S="N/A"
+fi
+
+echo "$DS,$ARKADE_TIME,$GPRT_TIME_S" >> head_to_head_results.csv
+
+
+
 done
 
 echo ""

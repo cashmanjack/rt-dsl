@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 gprt-ir = { path = "../gprt-ir" }
-syn = { version = "2.0", features = ["full", "extra-traits", "visit"] }
+syn = { version = "2.0", features = ["full", "extra-traits", "visit"] } # <--- "visit" must be here
 quote = "1.0"

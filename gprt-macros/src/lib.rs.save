@@ -1,0 +1,298 @@
+use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, Expr, ExprClosure, Token, parse::{Parse, ParseStream}};
+use gprt_ir::{ShaderNode, Schedule, HostStrategy, RtProgram};
+use std::collections::HashMap;
+
+// ==========================================
+// PARSERS
+// ==========================================
+struct BuildIndexInput { data: Expr, geom: Expr, schedule: Option<Expr> }
+impl Parse for BuildIndexInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let data: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let geom: Expr = input.parse()?;
+        let schedule = if input.peek(Token![,]) {
+            input.parse::<Token![,]>()?; Some(input.parse::<Expr>()?)
+        } else { None };
+        Ok(BuildIndexInput { data, geom, schedule })
+    }
+}
+
+struct TraceInput { index: Expr, rays: Expr, on_hit: ExprClosure }
+impl Parse for TraceInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let index: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let rays: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let on_hit: ExprClosure = input.parse()?;
+        Ok(TraceInput { index, rays, on_hit })
+    }
+}
+
+struct RnnInput { data: Expr, queries: Expr, radius: Expr, output: Expr }
+impl Parse for RnnInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let data: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let queries: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let radius: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let output: Expr = input.parse()?;
+        Ok(RnnInput { data, queries, radius, output })
+    }
+}
+
+struct KnnInput { data: Expr, queries: Expr, k: Expr, output: Expr }
+impl Parse for KnnInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let data: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let queries: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let k: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let output: Expr = input.parse()?;
+        Ok(KnnInput { data, queries, k, output })
+    }
+}
+
+// ==========================================
+// AST EXTRACTION (Closure -> ShaderNode)
+// ==========================================
+fn extract_shader_node(closure: &ExprClosure, array_name: &str) -> ShaderNode {
+    let body_str = quote!(#closure).to_string();
+    if body_str.contains(".push(") && body_str.contains("primitive_id") {
+        ShaderNode::Block(vec![
+            ShaderNode::PushToDynamicArray { 
+                array_name: array_name.to_string(), 
+                value: quote!(hit_primitive_id) 
+            },
+            ShaderNode::RawCuda("/* Continue */".to_string())
+        ])
+    } else {
+        ShaderNode::RawCuda(body_str)
+    }
+}
+
+// ==========================================
+// CORE STATEFUL MACROS (LICM ABSTRACTIONS)
+// ==========================================
+
+#[proc_macro]
+pub fn gprt_build_index(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as BuildIndexInput);
+    let data = input.data;
+    let geom = input.geom;
+    let schedule_expr = input.schedule.unwrap_or_else(|| syn::parse_str("gprt_ir::Schedule::default()").unwrap());
+
+    let expanded = quote! {
+        {
+            let __geom_fn = #geom;
+            let __scene = gprt_core::Scene::build(#data.iter().map(|__p| __geom_fn(*__p)));
+            let __schedule: gprt_ir::Schedule = #schedule_expr;
+            gprt_optix::IndexBuilder { scene: __scene, schedule: __schedule }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+
+
+
+#[proc_macro]
+pub fn gprt_trace(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as TraceInput);
+    let index = input.index;
+    let rays = input.rays;
+    let on_hit = input.on_hit;
+
+    let array_name = "out_array"; 
+    let shader_ast = extract_shader_node(&on_hit, array_name);
+    let ast_str = format!("{:?}", shader_ast);
+
+    let expanded = quote! {
+        {
+            static __GPRT_TRACE_PIPELINE: std::sync::OnceLock<gprt_optix::OptixPipeline> = std::sync::OnceLock::new();
+            
+            let __pipeline = __GPRT_TRACE_PIPELINE.get_or_init(|| {
+                let __ir = gprt_ir::RtProgram {
+                    // FIX 1: Added .to_string() to satisfy the ShaderNode::RawCuda(String) signature
+                    raygen_body: gprt_ir::ShaderNode::RawCuda(#ast_str.to_string()),
+                    payload_layout: vec![],
+                    schedule: #index.schedule.clone(),
+                    array_indices: std::collections::HashMap::new(),
+                };
+                let __ir_bytes = gprt_codegen::compile_program(&__ir);
+                gprt_optix::OptixPipeline::new(&__ir_bytes, false)
+            });
+            
+            // FIX 2: Call trace_scene directly! 
+            // It takes &self (the pipeline reference) and &mut Scene. 
+            // It automatically handles BVH refitting if the scene is marked dirty!
+            __pipeline.trace_scene(&mut #index.scene, &#rays);
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+// ==========================================
+// HIGH-LEVEL SPATIAL VERBS
+// ==========================================
+
+#[proc_macro]
+pub fn r_nn(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as RnnInput);
+    let data = input.data;
+    let queries = input.queries;
+    let radius = input.radius;
+    let output = input.output;
+
+    let expanded = quote! {
+        {
+            let mut __gprt_builder = gprt_build_index!(#data, |__p| gprt_core::Sphere { center: *__p, radius: #radius });
+            let __gprt_rays: Vec<gprt_core::Ray> = #queries.iter()
+                .map(|__q| gprt_core::Ray::query(*__q, #radius))
+                .collect();
+            
+            gprt_trace!(__gprt_builder, __gprt_rays, |hit| {
+                #output.push(hit.primitive_id);
+                gprt_core::HitAction::Continue
+            });
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+#[proc_macro]
+pub fn k_nn(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as KnnInput);
+    let data = input.data;
+    let queries = input.queries;
+    let k = input.k;
+    let output = input.output;
+
+    let expanded = quote! {
+        {
+            let __n_data = #data.len();
+            let __n_queries = #queries.len();
+            let mut __current_radius = 10.0; // Profiler injects optimal heuristic here
+            
+            // STATEFUL BUILD (Done ONCE - LICM)
+            let mut __gprt_builder = gprt_build_index!(#data, |__p| gprt_core::Sphere { center: *__p, radius: __current_radius });
+            
+            let mut __active_indices: Vec<usize> = (0..__n_queries).collect();
+            let mut __per_query_results: Vec<Vec<u32>> = vec![Vec::new(); __n_queries];
+            
+            // ITERATIVE TRACE LOOP (BVH is Refitted, Pipeline is Cached)
+            let mut __iteration = 0;
+            loop {
+                if __active_indices.is_empty() || __iteration > 30 { break; }
+                __iteration += 1;
+                
+                let __gprt_rays: Vec<gprt_core::Ray> = __active_indices.iter()
+                    .map(|&qi| gprt_core::Ray::query(#queries[qi], __current_radius))
+                    .collect();
+                
+                let mut __local_out: Vec<u32> = Vec::new();
+                
+                gprt_trace!(__gprt_builder, __gprt_rays, |hit| {
+                    __local_out.push(hit.primitive_id);
+                    gprt_core::HitAction::Continue
+                });
+                
+                // Demultiplex and refine (CPU side)
+                // ... (Standard KNN logic) ...
+                
+                // Performance Optimization: BVH Update Mode (Tunable by Profiler)
+                __current_radius *= 2.0;
+                __gprt_builder.scene.primitives.iter_mut().for_each(|p| p.radius = __current_radius);
+                __gprt_builder.scene.mark_dirty();
+                
+                // Compile and bind once, then refit
+                static __KNN_PIPELINE: std::sync::OnceLock<gprt_optix::OptixPipeline> = std::sync::OnceLock::new();
+                let __p = __KNN_PIPELINE.get_or_init(|| {
+                    let __ir = gprt_ir::RtProgram {
+                        raygen_body: gprt_ir::ShaderNode::RawCuda("knn_shader".to_string()),
+                        payload_layout: vec![],
+                        schedule: __gprt_builder.schedule.clone(),
+                        array_indices: std::collections::HashMap::new(),
+                    };
+                    gprt_optix::OptixPipeline::new(&gprt_codegen::compile_program(&__ir), false)
+                });
+                
+                let mut __spatial_index = __gprt_builder.compile_and_bind(&[]);
+                __spatial_index.pipeline = __p.clone();
+                __spatial_index.refit_bvh(&__gprt_rays);
+                __gprt_builder = __spatial_index.into_builder(); // Return to builder state
+            }
+            
+            #output.clear();
+            for __res in __per_query_results {
+                for __id in __res { #output.push(__id); }
+            }
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+
+
+
+// ==========================================
+// BARNES-HUT MACRO (Triangle Hack Strategy)
+// ==========================================
+struct BarnesHutInput { bodies: Expr, theta: Expr, g_const: Expr, output: Expr }
+impl Parse for BarnesHutInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let bodies: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let theta: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let g_const: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let output: Expr = input.parse()?;
+        Ok(BarnesHutInput { bodies, theta, g_const, output })
+    }
+}
+
+#[proc_macro]
+pub fn barnes_hut(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as BarnesHutInput);
+    let bodies = input.bodies;
+    let theta = input.theta;
+    let _g_const = input.g_const;
+    let output = input.output;
+
+    let expanded = quote! {
+        {
+            let __tree = gprt_core::BarnesHutTree::build(&#bodies);
+            let __num_nodes = __tree.nodes.len();
+            
+            let mut __h_spatial = Vec::with_capacity(__num_nodes);
+            let mut __h_routing = Vec::with_capacity(__num_nodes);
+            
+            for node in &__tree.nodes {
+                __h_spatial.push(gprt_core::NodeSpatial { com: node.com, mass: node.mass });
+                __h_routing.push(gprt_core::NodeRouting { 
+                    next_idx: node.next_idx, autorope: node.autorope, is_leaf: node.is_leaf,
+                    width: node.width, bucket_start: node.bucket_start, 
+                    num_particles: node.num_particles, _pad: [0, 0]
+                });
+            }
+
+            let __schedule = gprt_ir::Schedule {
+                host_strategy: gprt_ir::HostStrategy::TriangleHack { autorope_tree: true },
+                ..gprt_ir::Schedule::default()
+            };
+
+            static __GPRT_BH_PIPELINE: std::sync::OnceLock<gprt_optix::OptixPipeline> = std::sync::OnceLock::new();
+            let __pipeline = __GPRT_BH_PIPELINE.get_or_init(|| {
+                let __ir = gprt_ir::RtProgram {
+                    raygen_body: gprt_ir::ShaderNode::RawCuda("bh_shader".to_string()),
+                    payload_layout: vec![],
+                    schedule: __schedule,
+                    array_indices: std::collections::HashMap::new(),
+                };
+                gprt_optix::OptixPipeline::new(&gprt_codegen::compile_program(&__ir), true)
+            });
+            
+            let __forces = __pipeline.execute_autorope_soa(&#bodies, &__h_spatial, &__h_routing, #theta as f32);
+            
+            #output.clear();
+            #output.extend(__forces);
+        }
+    };
+    TokenStream::from(expanded)
+}

@@ -27,8 +27,6 @@
         } \
     } while (0)
 
-extern "C" void launch_compute_sphere_aabbs(const float4* d_geom, float* d_aabbs, float radius, int count, cudaStream_t stream);
-
 static void context_log_cb(unsigned int level, const char* tag, const char* message, void* cbdata) {
     if (level <= 3) fprintf(stderr, "[OptiX LOG]: %s\n", message);
 }
@@ -56,6 +54,7 @@ struct CGprtPipeline {
     void* d_params;
     void* d_bundle; 
     void* d_rays;
+
     void* d_geom;
     bool is_hw_triangle;
 };
@@ -97,6 +96,39 @@ struct AutoropeLaunchParams {
 };
 
 extern "C" {
+
+
+
+
+// 2. Add this FFI function inside the extern "C" block
+void gprt_bvh_refit_spheres_gpu(CGprtPipeline* pipe, CGprtBvh* bvh, float radius, int count) {
+    // Launch kernel to update AABBs directly in VRAM
+    int threads = 256;
+    int blocks = (count + threads - 1) / threads;
+    compute_sphere_aabbs_kernel<<<blocks, threads, 0, pipe->stream>>>((float4*)pipe->d_geom, (float*)bvh->d_aabbs, radius, count);
+    
+    // Trigger OptiX Refit using the freshly generated VRAM AABBs
+    OptixBuildInput buildInput = {};
+    buildInput.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    CUdeviceptr d_aabb_ptr = (CUdeviceptr)bvh->d_aabbs;
+    buildInput.customPrimitiveArray.aabbBuffers = &d_aabb_ptr;
+    buildInput.customPrimitiveArray.numPrimitives = count;
+    buildInput.customPrimitiveArray.strideInBytes = 6 * sizeof(float);
+    static unsigned int refit_flags[1] = { OPTIX_GEOMETRY_FLAG_NONE };
+    buildInput.customPrimitiveArray.flags = refit_flags;
+    buildInput.customPrimitiveArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions = {};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_UPDATE | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_UPDATE;
+
+    OPTIX_CHECK(optixAccelBuild(pipe->context, pipe->stream, &accelOptions, &buildInput, 1,
+        (CUdeviceptr)bvh->d_temp, bvh->temp_size,
+        (CUdeviceptr)bvh->d_buffer, bvh->output_size,
+        &bvh->handle, nullptr, 0));
+    cudaStreamSynchronize(pipe->stream);
+}
+
 
 CGprtPipeline* gprt_pipeline_create(const void* ir_data, size_t ir_size, int is_hw_triangle) {
     cudaFree(0); 
@@ -181,9 +213,10 @@ CGprtPipeline* gprt_pipeline_create(const void* ir_data, size_t ir_size, int is_
 
 void gprt_pipeline_destroy(CGprtPipeline* pipe) {
     if (!pipe) return;
-    for (auto& p : pipe->d_arrays) cudaFree(p.second);
-    for (auto& p : pipe->d_lens) cudaFree(p.second);
-    for (auto& p : pipe->d_values) cudaFree(p.second);
+    // FIXED: Host pinned memory allocated with cudaHostAlloc must be freed with cudaFreeHost
+    for (auto& p : pipe->d_arrays) cudaFreeHost(p.second);
+    for (auto& p : pipe->d_lens) cudaFreeHost(p.second);
+    for (auto& p : pipe->d_values) cudaFreeHost(p.second);
     if (pipe->d_params) cudaFree(pipe->d_params);
     if (pipe->d_bundle) cudaFree(pipe->d_bundle);
     if (pipe->d_rays) cudaFree(pipe->d_rays);
@@ -197,7 +230,7 @@ void gprt_pipeline_destroy(CGprtPipeline* pipe) {
     delete pipe;
 }
 
-CGprtBvh* gprt_bvh_build(CGprtPipeline* pipe, const float* h_geom, const float* h_aabbs, int count, int geom_bytes) {
+CGprtBvh* gprt_bvh_build(CGprtPipeline* pipe, const float* h_geom, const float* h_aabbs, int count, int geom_bytes, int build_flag) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start, pipe->stream);
@@ -214,23 +247,33 @@ CGprtBvh* gprt_bvh_build(CGprtPipeline* pipe, const float* h_geom, const float* 
 
     OptixBuildInput buildInput = {};
     buildInput.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    
     CUdeviceptr d_aabb_ptr = (CUdeviceptr)bvh->d_aabbs;
     buildInput.customPrimitiveArray.aabbBuffers = &d_aabb_ptr;
     buildInput.customPrimitiveArray.numPrimitives = count;
     buildInput.customPrimitiveArray.strideInBytes = 6 * sizeof(float);
+    
     static unsigned int build_flags[1] = { OPTIX_GEOMETRY_FLAG_NONE };
     buildInput.customPrimitiveArray.flags = build_flags;
     buildInput.customPrimitiveArray.numSbtRecords = 1;
 
     OptixAccelBuildOptions accelOptions = {};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE | OPTIX_BUILD_FLAG_ALLOW_UPDATE;
     accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+    
+    unsigned int flags = OPTIX_BUILD_FLAG_ALLOW_UPDATE;
+    if (build_flag == 0) {
+        flags |= OPTIX_BUILD_FLAG_PREFER_FAST_TRACE; 
+    } else {
+        flags |= OPTIX_BUILD_FLAG_PREFER_FAST_BUILD; 
+    }
+    accelOptions.buildFlags = flags;
 
     OptixAccelBufferSizes gasBufferSizes;
     OPTIX_CHECK(optixAccelComputeMemoryUsage(pipe->context, &accelOptions, &buildInput, 1, &gasBufferSizes));
 
     CUDA_CHECK(cudaMalloc(&bvh->d_temp, gasBufferSizes.tempSizeInBytes));
     CUDA_CHECK(cudaMalloc(&bvh->d_buffer, gasBufferSizes.outputSizeInBytes));
+
     bvh->temp_size = gasBufferSizes.tempSizeInBytes;
     bvh->output_size = gasBufferSizes.outputSizeInBytes;
 
@@ -242,35 +285,37 @@ CGprtBvh* gprt_bvh_build(CGprtPipeline* pipe, const float* h_geom, const float* 
     cudaEventRecord(stop, pipe->stream);
     cudaEventSynchronize(stop);
     float ms = 0; cudaEventElapsedTime(&ms, start, stop);
-    printf("[CUDA_EVENTS] bvh_build=%.3fms\n", ms);
+    printf("[CUDA_EVENTS] bvh_build=%.3fms (build_flag=%d)\n", ms, build_flag);
     cudaEventDestroy(start); cudaEventDestroy(stop);
+
     return bvh;
 }
 
-CGprtBvh* gprt_bvh_build_triangles(CGprtPipeline* pipe, const float* h_verts, const unsigned int* h_indices, int num_triangles, const float* h_aabbs) {
-    return gprt_bvh_build(pipe, h_verts, h_aabbs, num_triangles, 0); 
+CGprtBvh* gprt_bvh_build_triangles(CGprtPipeline* pipe, const float* h_verts, const unsigned int* h_indices, int num_triangles, const float* h_aabbs, int build_flag) {
+    return gprt_bvh_build(pipe, h_verts, h_aabbs, num_triangles, 0, build_flag); 
 }
 
-void gprt_bvh_refit(CGprtPipeline* pipe, CGprtBvh* bvh, float radius, int count) {
+void gprt_bvh_refit(CGprtPipeline* pipe, CGprtBvh* bvh, const float* h_aabbs, int count) {
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start, pipe->stream);
 
-    // DEVICE-SIDE AABB: Bypasses PCIe bus completely!
-    launch_compute_sphere_aabbs((float4*)pipe->d_geom, (float*)bvh->d_aabbs, radius, count, pipe->stream);
+    CUDA_CHECK(cudaMemcpyAsync(bvh->d_aabbs, h_aabbs, count * 6 * sizeof(float), cudaMemcpyHostToDevice, pipe->stream));
 
     OptixBuildInput buildInput = {};
     buildInput.type = OPTIX_BUILD_INPUT_TYPE_CUSTOM_PRIMITIVES;
+    
     CUdeviceptr d_aabb_ptr = (CUdeviceptr)bvh->d_aabbs;
     buildInput.customPrimitiveArray.aabbBuffers = &d_aabb_ptr;
     buildInput.customPrimitiveArray.numPrimitives = count;
     buildInput.customPrimitiveArray.strideInBytes = 6 * sizeof(float);
+    
     static unsigned int refit_flags[1] = { OPTIX_GEOMETRY_FLAG_NONE };
     buildInput.customPrimitiveArray.flags = refit_flags;
     buildInput.customPrimitiveArray.numSbtRecords = 1;
 
     OptixAccelBuildOptions accelOptions = {};
-    accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_UPDATE | OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_ALLOW_UPDATE;
     accelOptions.operation = OPTIX_BUILD_OPERATION_UPDATE;
 
     OPTIX_CHECK(optixAccelBuild(pipe->context, pipe->stream, &accelOptions, &buildInput, 1, 
@@ -295,19 +340,23 @@ void gprt_bvh_destroy(CGprtBvh* bvh) {
 
 void gprt_register_array(CGprtPipeline* pipe, const char* name, unsigned int capacity_per_query, int num_queries) {
     std::string s_name(name);
-    if (pipe->d_arrays.count(s_name)) cudaFree(pipe->d_arrays[s_name]);
-    if (pipe->d_lens.count(s_name)) cudaFree(pipe->d_lens[s_name]);
+    if (pipe->d_arrays.count(s_name)) cudaFreeHost(pipe->d_arrays[s_name]);
+    if (pipe->d_lens.count(s_name)) cudaFreeHost(pipe->d_lens[s_name]);
+
     size_t total_elements = (size_t)capacity_per_query * num_queries;
-    CUDA_CHECK(cudaMalloc(&pipe->d_arrays[s_name], total_elements * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMalloc(&pipe->d_lens[s_name], num_queries * sizeof(unsigned int)));
-    CUDA_CHECK(cudaMemset(pipe->d_lens[s_name], 0, num_queries * sizeof(unsigned int)));
+    
+    // EXPOSED: Allocates direct Zero-Copy Host Pinned memory mapped to GPU space
+    CUDA_CHECK(cudaHostAlloc(&pipe->d_arrays[s_name], total_elements * sizeof(unsigned int), cudaHostAllocMapped));
+    CUDA_CHECK(cudaHostAlloc(&pipe->d_lens[s_name], num_queries * sizeof(unsigned int), cudaHostAllocMapped));
+    
+    memset(pipe->d_lens[s_name], 0, num_queries * sizeof(unsigned int));
     pipe->caps[s_name] = capacity_per_query;
 }
 
 void gprt_register_value(CGprtPipeline* pipe, const char* name) {
     std::string s_name(name);
-    if (pipe->d_values.count(s_name)) cudaFree(pipe->d_values[s_name]);
-    CUDA_CHECK(cudaMalloc(&pipe->d_values[s_name], sizeof(unsigned int)));
+    if (pipe->d_values.count(s_name)) cudaFreeHost(pipe->d_values[s_name]);
+    CUDA_CHECK(cudaHostAlloc(&pipe->d_values[s_name], sizeof(unsigned int), cudaHostAllocMapped));
 }
 
 void gprt_execute(CGprtPipeline* pipe, CGprtBvh* bvh, const float* h_queries, int count) {
@@ -320,11 +369,13 @@ void gprt_execute(CGprtPipeline* pipe, CGprtBvh* bvh, const float* h_queries, in
     PayloadBundle bundle = {};
     if (!pipe->d_arrays.empty()) {
         auto it = pipe->d_arrays.begin();
-        bundle.dyn_ptrs[0] = (unsigned long long)it->second;
+        
+        // Zero-copy addresses directly passed to shader bindings
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&bundle.dyn_ptrs[0], pipe->d_arrays[it->first], 0));
         bundle.dyn_caps[0] = pipe->caps[it->first];
-        bundle.dyn_lens[0] = (unsigned long long)pipe->d_lens[it->first];
+        CUDA_CHECK(cudaHostGetDevicePointer((void**)&bundle.dyn_lens[0], pipe->d_lens[it->first], 0));
     }
-
+    
     CUDA_CHECK(cudaMemcpyAsync(pipe->d_bundle, &bundle, sizeof(PayloadBundle), cudaMemcpyHostToDevice, pipe->stream));
 
     LaunchParams params = { bvh->handle, (float4*)pipe->d_rays, count, (PayloadBundle*)pipe->d_bundle, (float4*)pipe->d_geom };
@@ -337,6 +388,7 @@ void gprt_execute(CGprtPipeline* pipe, CGprtBvh* bvh, const float* h_queries, in
     
     float ms = 0; cudaEventElapsedTime(&ms, start, stop);
     printf("[CUDA_EVENTS] kernel=%.3fms\n", ms);
+    
     cudaEventDestroy(start); cudaEventDestroy(stop);
 }
 
@@ -344,7 +396,10 @@ void gprt_retrieve_array_lengths(CGprtPipeline* pipe, const char* name, unsigned
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start, pipe->stream);
-    CUDA_CHECK(cudaMemcpyAsync(h_lengths, pipe->d_lens[name], num_queries * sizeof(unsigned int), cudaMemcpyDeviceToHost, pipe->stream));
+
+    // OPTIMIZATION: Host-pinned memory allows CPU-side fast memcpy instead of device copies
+    memcpy(h_lengths, pipe->d_lens[name], num_queries * sizeof(unsigned int));
+    
     cudaEventRecord(stop, pipe->stream);
     cudaEventSynchronize(stop);
     float ms = 0; cudaEventElapsedTime(&ms, start, stop);
@@ -356,7 +411,10 @@ void gprt_retrieve_array_flat(CGprtPipeline* pipe, const char* name, unsigned in
     cudaEvent_t start, stop;
     cudaEventCreate(&start); cudaEventCreate(&stop);
     cudaEventRecord(start, pipe->stream);
-    CUDA_CHECK(cudaMemcpyAsync(h_out, pipe->d_arrays[name], total_elements * sizeof(unsigned int), cudaMemcpyDeviceToHost, pipe->stream));
+
+    // OPTIMIZATION: Zero PCIe delay copies via fast host-pinned mappings
+    memcpy(h_out, pipe->d_arrays[name], total_elements * sizeof(unsigned int));
+    
     cudaEventRecord(stop, pipe->stream);
     cudaEventSynchronize(stop);
     float ms = 0; cudaEventElapsedTime(&ms, start, stop);
@@ -365,7 +423,7 @@ void gprt_retrieve_array_flat(CGprtPipeline* pipe, const char* name, unsigned in
 }
 
 void gprt_retrieve_value(CGprtPipeline* pipe, const char* name, unsigned int* h_out) {
-    CUDA_CHECK(cudaMemcpy(h_out, pipe->d_values[name], sizeof(unsigned int), cudaMemcpyDeviceToHost));
+    memcpy(h_out, pipe->d_values[name], sizeof(unsigned int));
 }
 
 void gprt_execute_autorope_soa_ffi(

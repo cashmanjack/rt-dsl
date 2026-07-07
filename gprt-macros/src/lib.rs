@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Expr, ExprClosure, Token, parse::{Parse, ParseStream}};
+use syn::{parse_macro_input, Expr, ExprClosure, Token, parse::{Parse, ParseStream}, LitStr};
 use std::collections::HashSet;
 use syn::visit::Visit;
 
@@ -49,7 +49,7 @@ impl Parse for RnnInput {
 }
 
 
-struct RnnRunInput { index: Expr, rays: Expr, schedule: Expr, cap: Expr, name: syn::Ident } 
+struct RnnRunInput { index: Expr, rays: Expr, schedule: Expr, cap: Expr, name: syn::Ident }
 impl Parse for RnnRunInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let index: Expr = input.parse()?; input.parse::<Token![,]>()?;
@@ -77,6 +77,21 @@ impl Parse for KnnInput {
     }
 }
 
+
+
+struct AutotuneInput { data: Expr, queries: Expr, k: Expr }
+impl Parse for AutotuneInput {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let data: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let queries: Expr = input.parse()?; input.parse::<Token![,]>()?;
+        let k: Expr = input.parse()?;
+        Ok(AutotuneInput { data, queries, k })
+    }
+}
+
+
+
+
 struct BarnesHutInput { bodies: Expr, theta: Expr, g_const: Expr, output: Expr }
 impl Parse for BarnesHutInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
@@ -88,9 +103,6 @@ impl Parse for BarnesHutInput {
     }
 }
 
-// ==========================================
-// AST VISITOR
-// ==========================================
 struct PayloadVisitor { pub arrays: HashSet<String> }
 impl<'ast> Visit<'ast> for PayloadVisitor {
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
@@ -103,8 +115,108 @@ impl<'ast> Visit<'ast> for PayloadVisitor {
     }
 }
 
+
+
+#[proc_macro]
+pub fn gprt_autotune(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as AutotuneInput);
+    let data = input.data;
+    let queries = input.queries;
+    let k = input.k;
+
+    let expanded = quote! {
+        {
+            println!("\n=========================================");
+            println!("   [GPRT AUTOTUNE] Adaptive Hill-Climbing Search");
+            println!("=========================================");
+            
+            let __full_data = &#data;
+            let __full_queries = &#queries;
+            
+            // Start at a mathematically safe baseline
+            let mut __best_p: f32 = 0.01;
+            let mut __best_m: f32 = 3.0;
+            let mut __best_time = std::time::Duration::MAX;
+            
+            // Define the step sizes for the adaptive search
+            let __p_steps = [-0.005, 0.005, -0.01, 0.05];
+            let __m_steps = [-0.5, 0.5, -1.0, 1.0];
+            
+            let mut __improved = true;
+            let mut __iterations = 0;
+            
+            while __improved && __iterations < 5 {
+                __improved = false;
+                __iterations += 1;
+                println!("   -> Hill-Climb Iteration {}", __iterations);
+                
+                // Test P perturbations
+                for &__dp in &__p_steps {
+		    let __test_p = (__best_p + __dp).max(0.001).min(0.20); 
+                    let mut __sched = gprt_ir::Schedule::default();
+                    __sched.radius_heuristic = gprt_ir::RadiusHeuristic::SampledPercentile(__test_p);
+                    __sched.radius_increment_mult = __best_m;
+                    __sched.memory_strategy = gprt_ir::MemoryStrategy::PayloadRegisterHeap;
+                    __sched.use_morton_lbv = true;
+                    
+                    let mut __out: Vec<Vec<u32>> = Vec::new();
+                    let __t0 = std::time::Instant::now();
+                    gprt_macros::k_nn!(__full_data, __full_queries, #k, __out, __sched);
+                    let __elapsed = __t0.elapsed();
+                    
+                    let __success = __out.len() == __full_queries.len() && __out.iter().all(|res| res.len() >= #k);
+                    if __success && __elapsed < __best_time {
+                        println!("      [CLIMB] P={:.3}, M={:.1} | Time: {:.3}ms (New Best!)", __test_p, __best_m, __elapsed.as_secs_f64() * 1000.0);
+                        __best_time = __elapsed;
+                        __best_p = __test_p;
+                        __improved = true;
+                    }
+                }
+                
+                // Test M perturbations
+                for &__dm in &__m_steps {
+                    let __test_m = (__best_m + __dm).max(1.5).min(5.0);
+                    let mut __sched = gprt_ir::Schedule::default();
+                    __sched.radius_heuristic = gprt_ir::RadiusHeuristic::SampledPercentile(__best_p);
+                    __sched.radius_increment_mult = __test_m;
+                    __sched.memory_strategy = gprt_ir::MemoryStrategy::PayloadRegisterHeap;
+                    __sched.use_morton_lbv = true;
+                    
+                    let mut __out: Vec<Vec<u32>> = Vec::new();
+                    let __t0 = std::time::Instant::now();
+                    gprt_macros::k_nn!(__full_data, __full_queries, #k, __out, __sched);
+                    let __elapsed = __t0.elapsed();
+                    
+                    let __success = __out.len() == __full_queries.len() && __out.iter().all(|res| res.len() >= #k);
+                    if __success && __elapsed < __best_time {
+                        println!("      [CLIMB] P={:.3}, M={:.1} | Time: {:.3}ms (New Best!)", __best_p, __test_m, __elapsed.as_secs_f64() * 1000.0);
+                        __best_time = __elapsed;
+                        __best_m = __test_m;
+                        __improved = true;
+                    }
+                }
+            }
+            
+            let mut __final_schedule = gprt_ir::Schedule::default();
+            __final_schedule.radius_heuristic = gprt_ir::RadiusHeuristic::SampledPercentile(__best_p);
+            __final_schedule.radius_increment_mult = __best_m;
+            __final_schedule.memory_strategy = gprt_ir::MemoryStrategy::PayloadRegisterHeap;
+            __final_schedule.use_morton_lbv = true;
+
+            println!("   -> Optimum Reached: P={:.3}, M={:.1} (Time: {:.3}ms)", __best_p, __best_m, __best_time.as_secs_f64() * 1000.0);
+            println!("=========================================\n");
+            
+            let __final_ret = __final_schedule;
+            __final_ret
+        }
+    };
+    TokenStream::from(expanded)
+}
+
+
+
 // ==========================================
-// 1. STATEFUL BUILD (LICM)
+// 2. STATEFUL BUILD (LICM)
 // ==========================================
 #[proc_macro]
 pub fn gprt_build_index(input: TokenStream) -> TokenStream {
@@ -124,9 +236,12 @@ pub fn gprt_build_index(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-// ==========================================
-// 2. ISOLATED RUN PRIMITIVE
-// ==========================================
+
+
+
+
+
+
 #[proc_macro]
 pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as RnnRunInput);
@@ -138,7 +253,6 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         {
-            // Cache pipelines per cap value to avoid recompiling on every iteration
             static __GPRT_RNN_PIPELINE_CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u32, gprt_optix::OptixPipeline>>> = std::sync::OnceLock::new();
             let __cache = __GPRT_RNN_PIPELINE_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
             
@@ -180,63 +294,42 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
                     optixIgnoreIntersection();
                 "#.to_string();
 
-                let __raygen_cuda_register_heap = format!(r#"
-                    {}
 
-                    uint3 launch_idx = optixGetLaunchIndex(); int idx = launch_idx.x; if (idx >= params.num_rays) return;
+
+
+
+
+                let k = __cap_val as usize; // This is 2*K
+                let half_k = k / 2;         // This is K
+
+                let __raygen_cuda_register_heap = format!(r#"
+                    uint3 launch_idx = optixGetLaunchIndex(); 
+                    int idx = launch_idx.x; 
+                    if (idx >= params.num_rays) return;
+                    PayloadBundle* bundle = params.bundle;
+
+                    // Layout: [ID0, ID1, ..., ID_K-1, Dist0, Dist1, ..., Dist_K-1]
+                    unsigned int* heap = &((unsigned int*)bundle->dyn_ptrs[0])[idx * {}];
+
                     float r_val = params.rays[idx].w;
+                    float r_sq = r_val * r_val;
+
+                    for (int i = 0; i < {}; i++) {{
+                        heap[i] = 0xFFFFFFFF;
+                        heap[{} + i] = __float_as_uint(r_sq);
+                    }}
+
                     float3 origin = make_float3(params.rays[idx].x, params.rays[idx].y, params.rays[idx].z); 
                     float3 direction = make_float3(1.0f, 0.0f, 0.0f);
 
-                    LocalHeap heap;
-                    for (int i = 0; i < {}; i++) {{
-                        heap.ids[i] = 0xFFFFFFFF;
-                        heap.dists[i] = r_val * r_val;
-                    }}
-                    heap.worst_dist = r_val * r_val;
-
-                    unsigned long long heap_ptr = (unsigned long long)&heap;
-                    unsigned int p0 = heap_ptr & 0xFFFFFFFF;
-                    unsigned int p1 = (heap_ptr >> 32) & 0xFFFFFFFF;
-                    unsigned int p2 = __float_as_uint(r_val * r_val);
-                    unsigned int p3 = 0; 
-
+                    // p2 holds the dynamic worst_dist for hardware pruning!
+                    unsigned int p0 = 0, p1 = 0, p2 = __float_as_uint(r_sq), p3 = 0; 
                     optixTrace(params.handle, origin, direction, 0.0f, 1e-5f, 0.0f, 1u, OPTIX_RAY_FLAG_NONE, 0u, 1u, 0u, p0, p1, p2, p3);
 
-                    PayloadBundle* bundle = params.bundle;
-                    unsigned int* out_ptr = (unsigned int*)bundle->dyn_ptrs[0];
                     unsigned int count = 0;
-                    for (int i = 0; i < {}; i++) {{
-                        out_ptr[idx * {} + i] = heap.ids[i];
-                        if (heap.ids[i] != 0xFFFFFFFF) count++;
-                    }}
+                    for (int i = 0; i < {}; i++) {{ if (heap[i] != 0xFFFFFFFF) count++; }}
                     ((unsigned int*)bundle->dyn_lens[0])[idx] = count;
-                "#, __struct_def, __k_str, __k_str, __k_str);
-
-                let __anyhit_cuda_register_heap = format!(r#"
-                    {}
-
-                    unsigned int prim_id = optixGetPrimitiveIndex();
-                    float dist_sq = __uint_as_float(optixGetPayload_3()); 
-
-                    unsigned long long heap_ptr = optixGetPayload_0() | ((unsigned long long)optixGetPayload_1() << 32);
-                    LocalHeap* heap = (LocalHeap*)heap_ptr;
-
-                    if (dist_sq < heap->worst_dist) {{
-                        heap->dists[{} - 1] = dist_sq;
-                        heap->ids[{} - 1] = prim_id;
-
-                        for (int i = {} - 2; i >= 0; i--) {{
-                            if (heap->dists[i+1] < heap->dists[i]) {{
-                                float tmp_d = heap->dists[i]; heap->dists[i] = heap->dists[i+1]; heap->dists[i+1] = tmp_d;
-                                unsigned int tmp_id = heap->ids[i]; heap->ids[i] = heap->ids[i+1]; heap->ids[i+1] = tmp_id;
-                            }}
-                        }}
-                        heap->worst_dist = heap->dists[{} - 1];
-                        optixSetPayload_2(__float_as_uint(heap->worst_dist)); 
-                    }}
-                    optixIgnoreIntersection();
-                "#, __struct_def, __k_str, __k_str, __k_str, __k_str);
+                "#, k, half_k, half_k, half_k);
 
                 let __intersection_cuda = r#"
                     unsigned int prim_id = optixGetPrimitiveIndex();
@@ -247,9 +340,41 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
                     float search_radius_sq = __uint_as_float(optixGetPayload_2());
                     if (dist_sq <= search_radius_sq) {
                         optixSetPayload_3(__float_as_uint(dist_sq));
-                        optixReportIntersection(0.0f, 0u);
+                        optixReportIntersection(1e-6f, 0u);
                     }
                 "#.to_string();
+
+                let __anyhit_cuda_register_heap = format!(r#"
+                    unsigned int prim_id = optixGetPrimitiveIndex();
+                    float exact_dist_sq = __uint_as_float(optixGetPayload_3());
+
+                    unsigned int __qid = optixGetLaunchIndex().x;
+                    PayloadBundle* bundle = params.bundle;
+                    unsigned int* heap = &((unsigned int*)bundle->dyn_ptrs[0])[__qid * {}];
+
+                    float worst_dist = __uint_as_float(heap[{}]); 
+
+                    if (exact_dist_sq < worst_dist) {{
+                        heap[{}] = prim_id;
+                        heap[{}] = __float_as_uint(exact_dist_sq);
+
+                        for (int i = {} - 2; i >= 0; i--) {{
+                            float d_curr = __uint_as_float(heap[{} + i]);
+                            float d_next = __uint_as_float(heap[{} + i + 1]);
+                            if (d_curr > d_next) {{
+                                heap[{} + i] = __float_as_uint(d_next);
+                                heap[{} + i + 1] = __float_as_uint(d_curr);
+                                unsigned int tmp_id = heap[i];
+                                heap[i] = heap[i + 1];
+                                heap[i + 1] = tmp_id;
+                            }} else {{
+                                break;
+                            }}
+                        }}
+                        optixSetPayload_2(heap[{}]); 
+                    }}
+                    optixIgnoreIntersection();
+                "#, k, k - 1, half_k - 1, k - 1, half_k, half_k, half_k, half_k, half_k, k - 1);
 
                 let __rg = if __is_register_heap { __raygen_cuda_register_heap } else { __raygen_cuda_global };
                 let __ah = if __is_register_heap { __anyhit_cuda_register_heap } else { __anyhit_cuda_global };
@@ -261,6 +386,8 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
                     intersection_body: Some(gprt_ir::ShaderNode::RawCuda(__intersection_cuda)),
                     payload_layout: vec![], schedule: __schedule_clone, array_indices: std::collections::HashMap::new(),
                 };
+
+
                 
                 let __pipeline = gprt_optix::OptixPipeline::new(&gprt_codegen::compile_program(&__ir), false);
                 __map.insert(__cap_val, __pipeline);
@@ -268,16 +395,14 @@ pub fn gprt_rnn_run(input: TokenStream) -> TokenStream {
             
             let __pipeline = __map.get(&__cap_val).unwrap();
             let __num_rays = #rays.len();
-            
-            // FIXED: Explicitly format the name as a string literal to prevent "expected identifier" phantom errors
             let __name_str: &str = #name;
+            
             __pipeline.register_array_batched(__name_str, __cap_val, __num_rays);
             __pipeline.trace_scene(&mut #index.scene, &#rays, &#schedule); 
             __pipeline.retrieve_array_batched(__name_str, __num_rays, __cap_val as usize)
         }
     };
     TokenStream::from(expanded)
-
 }
 
 #[proc_macro]
@@ -342,8 +467,9 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
                 __iteration += 1;
                 
                 let mut __dynamic_cap = 128u32; 
+
                 if __schedule.memory_strategy == gprt_ir::MemoryStrategy::PayloadRegisterHeap {
-                    __dynamic_cap = #k as u32; 
+                    __dynamic_cap = (#k * 2) as u32; 
                 } else {
                     if __iteration == 2 { __dynamic_cap = 256; }
                     if __iteration == 3 { __dynamic_cap = 512; }
@@ -360,18 +486,44 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
                     .map(|&qi| gprt_core::Ray::query(#queries[qi], __current_radius))
                     .collect();
                 
+
+
+
+
                 let __t_trace = std::time::Instant::now();
                 let __cap_u32: u32 = __dynamic_cap;
+
                 let (__flat_res, __lens) = gprt_macros::gprt_rnn_run!(__index, __rays, __schedule, __cap_u32, out);
+
+                // ==========================================
+                // DEBUG PRINTS: RAW VRAM DUMP
+                // ==========================================
+                if __iteration == 1 {
+                    println!("\n[DEBUG ROUND 1] GPU -> CPU Raw Memory Dump (Cap={}):", __cap_u32);
+                    for dbg_idx in 0..3 {
+                        let start = dbg_idx * (__cap_u32 as usize);
+                        let end = start + (__cap_u32 as usize);
+                        let lens_val = __lens.get(dbg_idx).unwrap_or(&999);
+                        let slice = if end <= __flat_res.len() { &__flat_res[start..end] } else { &[] };
+                        println!("  Query {}: Lens={}, RawHeap={:?}", dbg_idx, lens_val, slice);
+                    }
+                    println!("-------------------------------------------------\n");
+                }
+
                 __total_search_time += __t_trace.elapsed();
+
+
+
                 
                 let mut __next_active = Vec::new();
                 let mut __saturated_count = 0;
                 
                 if __schedule.memory_strategy == gprt_ir::MemoryStrategy::PayloadRegisterHeap {
+
+
                     for (local_idx, &global_qi) in __active_indices.iter().enumerate() {
                         let hit_count = __lens[local_idx] as usize;
-                        let start = local_idx * (#k as usize); 
+                        let start = local_idx * (#k as usize * 2); 
 
                         if hit_count >= #k {
                             for __i in 0..#k { #output[global_qi].push(__flat_res[start + __i]); }
@@ -381,6 +533,8 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
                             __next_active.push(global_qi);
                         }
                     }
+
+
                 } else {
                     use rayon::prelude::*;
                     let __results_updates: Vec<(usize, Vec<u32>, bool, bool)> = (0..__active_indices.len())
@@ -449,8 +603,24 @@ pub fn k_nn(input: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // ==========================================
-// 4. LEGACY TRACE / RNN / BARNES HUT 
+// 5. LEGACY MACROS (RETAINED)
 // ==========================================
 #[proc_macro]
 pub fn gprt_trace(input: TokenStream) -> TokenStream {
@@ -611,7 +781,7 @@ pub fn barnes_hut(input: TokenStream) -> TokenStream {
             for (unsigned int i = 0; i < routing.num_particles; i = i + 1) {
                 Body b = params.bodies[routing.bucket_start + i];
                 float3 d_diff = make_float3(b.pos.x - params.bodies[qid].pos.x, b.pos.y - params.bodies[qid].pos.y, b.pos.z - params.bodies[qid].pos.z);
-                float d_dist_sq = gprt_dot(d_diff, d_dist_sq);
+                float d_dist_sq = gprt_dot(d_diff, d_diff);
                 if (d_dist_sq > 1e-10f) { float denom = d_dist_sq * sqrt(d_dist_sq + 1e-6f); float force_mag = (6.674e-11f * params.bodies[qid].mass * b.mass) / denom; state.x += d_diff.x * force_mag; state.y += d_diff.y * force_mag; state.z += d_diff.z * force_mag; }
             } optixSetPayload_0(routing.autorope);
         } else {

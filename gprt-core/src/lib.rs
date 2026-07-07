@@ -1,8 +1,11 @@
 use std::ops::{Add, Sub, Mul, Div};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod morton;
+
 static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 { pub x: f32, pub y: f32, pub z: f32 }
 
@@ -61,6 +64,9 @@ pub trait Geometry: Sized {
     fn name() -> &'static str;
     fn pack_optix(&self) -> Vec<f32>;
     fn get_hardware_triangle_buffers(_primitives: &[Self]) -> Option<(Vec<f32>, Vec<u32>)> { None }
+    
+    // NEW: Allow fast radius mutations for Loop Invariant Code Motion (LICM)
+    fn set_radius(&mut self, _radius: f32) {} 
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -69,6 +75,10 @@ impl Geometry for Sphere {
     fn name() -> &'static str { "Sphere" }
     fn pack_optix(&self) -> Vec<f32> { vec![self.center.x, self.center.y, self.center.z, self.radius] }
     fn bounds(&self) -> AABB { let r = Vec3::new(self.radius, self.radius, self.radius); AABB { min: self.center - r, max: self.center + r } }
+    
+    // NEW: Implement for Sphere
+    fn set_radius(&mut self, radius: f32) { self.radius = radius; }
+    
     fn intersect(&self, ray: &Ray) -> Option<Hit> {
         let dx = ray.origin.x - self.center.x;
         let dy = ray.origin.y - self.center.y;
@@ -244,5 +254,287 @@ impl<G: Geometry> Scene<G> {
         if !terminated {
             if let Some(hit) = best_hit { closest_hit_cb(hit); }
         }
+    }
+}
+
+
+
+fn expand_bits(v: u32) -> u32 {
+    let mut v = v & 0x000003ff; // 10 bits
+    v = (v | (v << 16)) & 0x030000ff;
+    v = (v | (v <<  8)) & 0x0300f00f;
+    v = (v | (v <<  4)) & 0x030c30c3;
+    v = (v | (v <<  2)) & 0x09249249;
+    v
+}
+
+fn morton3d(x: u32, y: u32, z: u32) -> u32 {
+    (expand_bits(x) << 2) | (expand_bits(y) << 1) | expand_bits(z)
+}
+
+const BUCKET_SIZE: usize = 128;
+const MIN_SPLIT_SIZE: f32 = 1e-5f32;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NodeSpatial {
+    pub com: Vec3,
+    pub mass: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NodeRouting {
+    pub next_idx: u32,
+    pub autorope: u32,
+    pub is_leaf: u32,
+    pub width: f32,
+    pub bucket_start: u32,
+    pub num_particles: u32,
+    pub _pad: [u32; 2],     
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlatNode {
+    pub com: Vec3,
+    pub mass: f32,
+    pub width: f32,
+    pub is_leaf: u32,
+    pub next_idx: u32,
+    pub autorope: u32,
+    pub bucket_start: u32,
+    pub num_particles: u32,
+}
+
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Body {
+    pub pos: Vec3,
+    pub mass: f32,
+    pub velocity: Vec3,
+}
+
+struct OctreeNode {
+    bbox: AABB,
+    children: Vec<usize>,
+    com: Vec3,
+    mass: f32,
+    body_start: usize,
+    body_count: usize,
+}
+
+pub struct BarnesHutTree {
+    pub nodes: Vec<FlatNode>,
+    pub bodies: Vec<Body>, 
+}
+
+
+struct TreeBuilder<'a> {
+    bodies: &'a [Body],
+    arena: Vec<OctreeNode>,
+    scratch: Vec<usize>, 
+}
+
+impl<'a> TreeBuilder<'a> {
+    fn build_recursive(
+        &mut self,
+        indices: &mut [usize], 
+        bbox: AABB,
+        current_width: f32,
+        abs_start_offset: usize,
+    ) -> usize {
+        let node_idx = self.arena.len();
+        let count = indices.len();
+        let is_leaf = count <= BUCKET_SIZE || current_width < MIN_SPLIT_SIZE;
+        
+        self.arena.push(OctreeNode {
+            bbox,
+            children: Vec::new(),
+            com: Vec3::new(0.0, 0.0, 0.0),
+            mass: 0.0,
+            body_start: abs_start_offset,
+            body_count: if is_leaf { count } else { 0 }, 
+        });
+
+        if is_leaf { return node_idx; }
+
+        let center = bbox.center();
+        
+        let mut counts = [0usize; 8];
+        for &i in indices.iter() {
+            let b = &self.bodies[i];
+            let mut oct = 0;
+            if b.pos.x >= center.x { oct |= 1; }
+            if b.pos.y >= center.y { oct |= 2; }
+            if b.pos.z >= center.z { oct |= 4; }
+            counts[oct] += 1;
+        }
+        
+        let mut offsets = [0usize; 8];
+        for i in 1..8 { offsets[i] = offsets[i-1] + counts[i-1]; }
+        
+        let scratch_slice = &mut self.scratch[abs_start_offset .. abs_start_offset + count];
+        let mut current_offsets = offsets;
+        for &i in indices.iter() {
+            let b = &self.bodies[i];
+            let mut oct = 0;
+            if b.pos.x >= center.x { oct |= 1; }
+            if b.pos.y >= center.y { oct |= 2; }
+            if b.pos.z >= center.z { oct |= 4; }
+            scratch_slice[current_offsets[oct]] = i;
+            current_offsets[oct] += 1;
+        }
+        
+        indices.copy_from_slice(scratch_slice);
+        
+        let mut children = Vec::new();
+        let child_width = current_width * 0.5;
+        
+        let mut current_rel_offset = 0; 
+        let mut current_abs_offset = abs_start_offset; 
+        
+        for oct in 0..8 {
+            let c_count = counts[oct];
+            if c_count > 0 {
+                let min_x = if (oct & 1) == 0 { bbox.min.x } else { center.x };
+                let max_x = if (oct & 1) == 0 { center.x } else { bbox.max.x };
+                let min_y = if (oct & 2) == 0 { bbox.min.y } else { center.y };
+                let max_y = if (oct & 2) == 0 { center.y } else { bbox.max.y };
+                let min_z = if (oct & 4) == 0 { bbox.min.z } else { center.z };
+                let max_z = if (oct & 4) == 0 { center.z } else { bbox.max.z };
+                let child_bbox = AABB { min: Vec3::new(min_x, min_y, min_z), max: Vec3::new(max_x, max_y, max_z) };
+                
+                let child_idx = self.build_recursive(
+                    &mut indices[current_rel_offset .. current_rel_offset + c_count], 
+                    child_bbox,
+                    child_width,
+                    current_abs_offset, 
+                );
+                children.push(child_idx);
+                
+                current_rel_offset += c_count;
+                current_abs_offset += c_count;
+            }
+        }
+        
+        self.arena[node_idx].children = children;
+        node_idx
+    }
+}
+
+impl BarnesHutTree {
+    pub fn build(bodies: &[Body]) -> Self {
+        if bodies.is_empty() { return Self { nodes: Vec::new(), bodies: Vec::new() }; }
+
+        let mut min_b = Vec3::new(f32::MAX, f32::MAX, f32::MAX);
+        let mut max_b = Vec3::new(f32::MIN, f32::MIN, f32::MIN);
+        for b in bodies { min_b = min_b.min(&b.pos); max_b = max_b.max(&b.pos); }
+        
+        let extent = max_b - min_b;
+        let max_extent = extent.x.max(extent.y).max(extent.z);
+        let center = Vec3::new((min_b.x + max_b.x) * 0.5, (min_b.y + max_b.y) * 0.5, (min_b.z + max_b.z) * 0.5);
+        
+        let mut root_bbox = AABB::empty();
+        root_bbox.min = Vec3::new(center.x - max_extent/2.0, center.y - max_extent/2.0, center.z - max_extent/2.0);
+        root_bbox.max = Vec3::new(center.x + max_extent/2.0, center.y + max_extent/2.0, center.z + max_extent/2.0);
+
+        let scale = if max_extent > 0.0 { 1023.0 / max_extent } else { 0.0 };
+
+        let mut indices: Vec<usize> = (0..bodies.len()).collect();
+        indices.sort_unstable_by_key(|&i| {
+            let b = &bodies[i];
+            let lx = ((b.pos.x - min_b.x) * scale) as u32;
+            let ly = ((b.pos.y - min_b.y) * scale) as u32;
+            let lz = ((b.pos.z - min_b.z) * scale) as u32;
+            morton3d(lx, ly, lz)
+        });
+
+        let mut builder = TreeBuilder {
+            bodies,
+            arena: Vec::new(),
+            scratch: vec![0; bodies.len()], 
+        };
+        
+        builder.build_recursive(&mut indices, root_bbox, max_extent, 0);
+
+        if !builder.arena.is_empty() { Self::compute_com(0, &mut builder.arena, bodies, &indices); }
+
+        let mut flat_nodes = Vec::new();
+        let mut flat_bodies = Vec::new();
+        if !builder.arena.is_empty() { Self::flatten_dfs(0, &builder.arena, &mut flat_nodes, &mut flat_bodies, bodies, &indices); }
+
+        Self { nodes: flat_nodes, bodies: flat_bodies }
+    }
+
+    fn compute_com(node_idx: usize, arena: &mut Vec<OctreeNode>, bodies: &[Body], indices: &[usize]) {
+        if arena[node_idx].children.is_empty() {
+            let mut total_mass = 0.0;
+            let mut com = Vec3::new(0.0, 0.0, 0.0);
+            let start = arena[node_idx].body_start;
+            let count = arena[node_idx].body_count;
+            for i in 0..count {
+                let b = &bodies[indices[start + i]];
+                total_mass += b.mass;
+                com = com + (b.pos * b.mass);
+            }
+            arena[node_idx].mass = total_mass;
+            if total_mass > 0.0 { arena[node_idx].com = com / total_mass; }
+            return;
+        }
+
+        let mut total_mass = 0.0;
+        let mut com = Vec3::new(0.0, 0.0, 0.0);
+        let children = arena[node_idx].children.clone();
+
+        for child_idx in children {
+            Self::compute_com(child_idx, arena, bodies, indices);
+            let child_mass = arena[child_idx].mass;
+            let child_com = arena[child_idx].com;
+            total_mass += child_mass;
+            com = com + (child_com * child_mass);
+        }
+
+        arena[node_idx].mass = total_mass;
+        if total_mass > 0.0 { arena[node_idx].com = com / total_mass; }
+    }
+
+    fn flatten_dfs(node_idx: usize, arena: &[OctreeNode], flat_array: &mut Vec<FlatNode>, flat_bodies: &mut Vec<Body>, bodies: &[Body], indices: &[usize]) -> usize {
+        let current_flat_idx = flat_array.len();
+        let node = &arena[node_idx];
+        let extent = node.bbox.max - node.bbox.min;
+        let width = extent.x.max(extent.y).max(extent.z);
+
+        let mut bucket_start = 0;
+        let num_particles = node.body_count as u32;
+        
+        if num_particles > 0 {
+            bucket_start = flat_bodies.len() as u32;
+            let start = node.body_start;
+            for i in 0..node.body_count {
+                flat_bodies.push(bodies[indices[start + i]]);
+            }
+        }
+
+        flat_array.push(FlatNode {
+            com: node.com,
+            mass: node.mass,
+            width,
+            is_leaf: if node.children.is_empty() { 1 } else { 0 },
+            next_idx: (current_flat_idx + 1) as u32,
+            autorope: 0, 
+            bucket_start,
+            num_particles,
+        });
+
+        for &child_idx in &node.children {
+            Self::flatten_dfs(child_idx, arena, flat_array, flat_bodies, bodies, indices);
+        }
+
+        let autorope_idx = flat_array.len() as u32;
+        flat_array[current_flat_idx].autorope = autorope_idx;
+
+        flat_array.len() - current_flat_idx
     }
 }

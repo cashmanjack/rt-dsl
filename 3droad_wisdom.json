@@ -1,0 +1,1 @@
+{"radius_increment_mult": 2.0, "max_hits_per_query": 2000, "use_morton_lbv": true, "radius_heuristic": {"SampledPercentile": 0.2}, "memory_strategy": "PayloadRegisterHeap"}

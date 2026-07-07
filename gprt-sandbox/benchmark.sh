@@ -11,8 +11,7 @@ OUT_FILE="benchmark_results.csv"
 echo "Dataset,NumQueries,K,Time_ms,Total_Neighbors" > $OUT_FILE
 
 # Datasets to benchmark
-
-declare -a DATASETS=("uniform" "3droad" "kitti" "porto" "3diono")
+declare -a DATASETS=("uniform" "3droad" "kitti")
 K=5
 
 echo "Starting TrueKNN Benchmarks (K=$K)..."

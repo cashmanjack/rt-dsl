@@ -5,6 +5,10 @@ edition = "2021"
 
 [dependencies]
 gprt-core = { path = "../gprt-core" }
+gprt-ir = { path = "../gprt-ir" }
+gprt-codegen = { path = "../gprt-codegen" }
+serde_json = "1.0"
+rayon = "1.8"
 
 [build-dependencies]
 cmake = "0.1"

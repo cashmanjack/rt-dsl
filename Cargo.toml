@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "gprt-core",
+    "gprt-ir",
+    "gprt-codegen",
+    "gprt-optix",
+    "gprt-macros",
+    "gprt-sandbox",
+    "gprt-profiler"
+]
+resolver = "2"

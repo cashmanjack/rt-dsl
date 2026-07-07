@@ -31,3 +31,9 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Raw dataset files (too large for GitHub; download separately)
+*.pbf
+*.osm
+*.bin
+gprt-sandbox/data/raw_data_downloader/

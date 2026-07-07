@@ -35,7 +35,7 @@ tree = cKDTree(data_sampled)
 truth_dists, truth_indices = tree.query(queries_sampled, k=k, workers=-1)
 
 # Parameter Grid Sweep
-percentiles = [0.02, 0.05, 0.10, 0.15, 0.20]
+percentiles = [0.02, 0.05, 0.10, 0.15, 0.20, 0.50, 0.99]
 multipliers = [1.5, 2.0, 2.5, 3.0, 3.5]
 
 best_time = float('inf')
